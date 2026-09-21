@@ -1,6 +1,8 @@
 import os
 import re
+import time
 import logging
+import asyncio
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
@@ -26,13 +28,13 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-# ================= KEEPALIVE FLASK / HTTP =================
+# ================= KEEPALIVE HTTP =================
 class KeepAliveHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Atleon Stealth Executor Activo!")
+        self.wfile.write(b"Atleon Stealth Executor Live")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -49,7 +51,7 @@ api = None
 def conectar_iq():
     global api
     try:
-        logging.info(f"Conectando a IQ con {IQ_USER}...")
+        logging.info(f"Conectando a IQ Option ({IQ_USER})...")
         cliente = IQ_Option(IQ_USER.strip(), IQ_PASS.strip())
         ok, reason = cliente.connect()
         if ok:
@@ -58,10 +60,10 @@ def conectar_iq():
             logging.info(f"✅ Conectado exitosamente. Saldo: ${api.get_balance():.2f}")
             return True
         else:
-            logging.error(f"❌ Error conectando: {reason}")
+            logging.error(f"❌ Error al conectar: {reason}")
             return False
     except Exception as e:
-        logging.error(f"❌ Excepción: {e}")
+        logging.error(f"❌ Excepción en conexión: {e}")
         return False
 
 def asegurar_sesion():
@@ -70,31 +72,28 @@ def asegurar_sesion():
         return conectar_iq()
     return True
 
-# ================= MOTOR DE DISPARO =================
-def disparar_orden(par, direccion, duracion):
+# ================= MOTOR DE DISPARO SIN BLOQUEO =================
+def _ejecutar_en_broker(par, dir_iq, duracion):
     global api
     if not asegurar_sesion():
-        return False, "Broker no disponible"
+        return False, "Broker desconectado"
 
-    dir_iq = direccion.lower()
     par_limpio = par.upper().replace("/", "").strip()
-
-    # Normalización de alias Blitz
     if par_limpio in ["GER30", "GER 30", "GERMANY30"]:
         par_limpio = "GERMANY30"
     elif par_limpio in ["AU200", "AU 200", "AUS200"]:
         par_limpio = "AUS200"
 
-    # 1. Modo Blitz (30s)
+    # MODO BLITZ 30s
     if "30" in str(duracion):
         try:
             ok, id_op = api.buy_digital_spot(par_limpio, TRADE_AMOUNT, dir_iq, 30)
             if ok and id_op:
                 return True, f"Blitz 30s #{id_op}"
         except Exception as e:
-            logging.error(f"Digital Spot error: {e}")
+            logging.warning(f"Digital Spot no disponible para {par_limpio}: {e}")
 
-        # Fallback a binarias 1m
+        # Fallback a binaria
         try:
             ok, id_op = api.buy(TRADE_AMOUNT, par_limpio, dir_iq, 1)
             if ok and id_op:
@@ -103,7 +102,7 @@ def disparar_orden(par, direccion, duracion):
         except Exception as err:
             return False, str(err)
 
-    # 2. Modo Binarias 60s (Forex / OTC)
+    # MODO BINARIAS 60s
     else:
         try:
             ok, id_op = api.buy(TRADE_AMOUNT, par_limpio, dir_iq, 1)
@@ -112,6 +111,19 @@ def disparar_orden(par, direccion, duracion):
             return False, str(id_op)
         except Exception as err:
             return False, str(err)
+
+async def disparar_orden_segura(par, direccion, duracion):
+    dir_iq = direccion.lower()
+    try:
+        # Ejecución en hilo secundario con límite de 3.5 segundos
+        return await asyncio.wait_for(
+            asyncio.to_thread(_ejecutar_en_broker, par, dir_iq, duracion),
+            timeout=3.5
+        )
+    except asyncio.TimeoutError:
+        return False, "Tiempo de espera agotado en broker (Timeout)"
+    except Exception as e:
+        return False, str(e)
 
 # ================= HANDLERS TELEGRAM =================
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -133,7 +145,6 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     texto = update.message.text.strip().upper()
 
-    # Detección de dirección
     direccion = None
     if any(w in texto for w in ["CALL", "SUBE", "COMPRA"]):
         direccion = "CALL"
@@ -143,10 +154,8 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not direccion:
         return
 
-    # Detección de duración
-    duracion = "30S" if any(w in texto for w in ["30S", "30 S", "BLITZ"]) else "60S"
+    duracion = "30S" if any(w in texto for w in ["30S", "30 S", "BLITZ", "30"]) else "60S"
 
-    # Detección de par
     par = None
     if "GER30" in texto or "GERMANY30" in texto or "GER 30" in texto:
         par = "GERMANY30"
@@ -164,7 +173,7 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     logging.info(f"⚡ Disparando orden: {par} {direccion} {duracion}")
-    exito, info = disparar_orden(par, direccion, duracion)
+    exito, info = await disparar_orden_segura(par, direccion, duracion)
 
     estado = "✅" if exito else "⚠️"
     await update.message.reply_text(
