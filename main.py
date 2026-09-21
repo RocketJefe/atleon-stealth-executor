@@ -29,7 +29,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-# ================= 2. SERVIDOR KEEPALIVE HTTP =================
+# ================= 2. KEEPALIVE HTTP =================
 class KeepAliveHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -46,7 +46,7 @@ def run_web():
     server = HTTPServer(("0.0.0.0", port), KeepAliveHandler)
     server.serve_forever()
 
-# ================= 3. CONEXIÓN A IQ OPTION =================
+# ================= 3. CONEXIÓN IQ OPTION =================
 api = None
 
 def conectar_iq():
@@ -58,10 +58,10 @@ def conectar_iq():
         if ok:
             cliente.change_balance(IQ_ACCOUNT_TYPE)
             api = cliente
-            logging.info(f"⚡ [BLITZ LISTO] Saldo: ${api.get_balance():.2f}")
+            logging.info(f"⚡ [BLITZ ENGINE LISTO] Saldo: ${api.get_balance():.2f}")
             return True
         else:
-            logging.error(f"❌ Error al conectar a IQ: {reason}")
+            logging.error(f"❌ Error al conectar: {reason}")
             return False
     except Exception as e:
         logging.error(f"❌ Excepción: {e}")
@@ -73,60 +73,55 @@ def asegurar_sesion():
         return conectar_iq()
     return True
 
-# ================= 4. MOTOR BLITZ =================
-def _disparar_blitz_en_broker(activo_input, dir_iq):
+# ================= 4. MOTOR EXCLUSIVO BLITZ =================
+def _disparar_blitz(activo_str, dir_iq):
     global api
     if not asegurar_sesion():
         return False, "Broker desconectado"
 
-    raw = activo_input.upper().replace("/", "").strip()
+    raw = activo_str.upper().replace("/", "").strip()
 
-    # Variantes exactas usadas en backend e interfaz para índices Blitz
+    # Opciones de nombres probables para Blitz en el backend
     candidatos = [raw]
     if any(k in raw for k in ["GER", "GERMANY", "DE"]):
-        candidatos = ["GER 30", "GER30", "GER_30", "GERMANY30", "DE30"]
+        candidatos = ["GER 30", "GER30", "GER_30", "GERMANY30", "DE30", "1232"]
     elif any(k in raw for k in ["AU", "AUS"]):
-        candidatos = ["AU 200", "AU200", "AU_200", "AUS200"]
+        candidatos = ["AU 200", "AU200", "AU_200", "AUS200", "1234"]
     elif "TRUMP" in raw:
         candidatos = ["TRUMP Coin", "TRUMP", "TRUMP_COIN"]
 
-    ultimo_err = "Sin cotización"
+    ultimo_error = "Sin respuesta"
 
+    # Intento 1: Disparo Turbo directo (Blitz se enruta como contrato turbo de corta duración)
     for act in candidatos:
-        # Intento A: Suscripción y compra Digital Spot
+        try:
+            ok, id_op = api.buy(TRADE_AMOUNT, act, dir_iq, 1)
+            if ok and (isinstance(id_op, int) or id_op):
+                return True, f"Blitz Directo #{id_op} en `{act}`"
+            else:
+                ultimo_error = str(id_op)
+        except Exception as e:
+            ultimo_error = str(e)
+
+    # Intento 2: Disparo Digital Spot con suscripción previa
+    for act in candidatos:
         try:
             api.subscribe_strike_list(act, 1)
-            time.sleep(0.3)
+            time.sleep(0.35)
             ok, id_op = api.buy_digital_spot(act, TRADE_AMOUNT, dir_iq, 1)
             if ok and id_op:
                 api.unsubscribe_strike_list(act, 1)
                 return True, f"Blitz Spot #{id_op} en `{act}`"
         except Exception as e:
-            ultimo_err = str(e)
+            ultimo_error = str(e)
 
-        # Intento B: buy_digital_spot_v2
-        try:
-            ok, id_op = api.buy_digital_spot_v2(act, TRADE_AMOUNT, dir_iq, 1)
-            if ok and id_op:
-                return True, f"Blitz SpotV2 #{id_op} en `{act}`"
-        except Exception as e:
-            ultimo_err = str(e)
+    return False, f"Rechazado ({ultimo_error})"
 
-        # Intento C: Orden binaria rápida en el par
-        try:
-            ok, id_op = api.buy(TRADE_AMOUNT, act, dir_iq, 1)
-            if ok and (isinstance(id_op, int) or id_op):
-                return True, f"Blitz Directo #{id_op} en `{act}`"
-        except Exception as e:
-            ultimo_err = str(e)
-
-    return False, f"Rechazado ({ultimo_err})"
-
-async def ejecutar_blitz_seguro(activo, direccion):
+async def disparar_blitz_seguro(activo, direccion):
     dir_iq = direccion.lower()
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(_disparar_blitz_en_broker, activo, dir_iq),
+            asyncio.to_thread(_disparar_blitz, activo, dir_iq),
             timeout=4.5
         )
     except asyncio.TimeoutError:
@@ -134,7 +129,7 @@ async def ejecutar_blitz_seguro(activo, direccion):
     except Exception as e:
         return False, str(e)
 
-# ================= 5. COMANDOS TELEGRAM =================
+# ================= 5. CONTROLADORES TELEGRAM =================
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if asegurar_sesion():
         saldo = api.get_balance()
@@ -154,43 +149,51 @@ async def detectar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Broker desconectado.")
         return
 
-    msg = await update.message.reply_text("🔍 Escaneando activos en Digitales y Blitz...")
+    msg = await update.message.reply_text("🔍 Rastreando activos Blitz en la memoria de IQ...")
+    encontrados = []
+    
     try:
-        # Consulta catálogo digital y blitz
-        digital_data = api.get_all_digital_open_time()
-        encontrados = []
-
-        for nombre in digital_data.keys():
-            if any(k in nombre.upper() for k in ["GER", "AU", "DE", "TRUMP", "US", "30", "200"]):
-                encontrados.append(f"• `{nombre}`")
-
-        # Si el diccionario digital directo viene vacío, consultar la lista completa de inicialización
-        if not encontrados:
-            init_data = api.get_all_init()
-            if init_data and "result" in init_data:
-                for cat in ["turbo", "digital", "binary"]:
-                    activos = init_data["result"].get(cat, {}).get("actives", {})
-                    for aid, info in activos.items():
-                        n = info.get("name", "")
-                        if any(k in n.upper() for k in ["GER", "AU", "DE", "TRUMP"]):
-                            encontrados.append(f"• `{n}` (ID: `{aid}` | {cat})")
-
-        if encontrados:
-            txt = "⚡ **Nombres exactos detectados para Blitz/Digital:**\n\n" + "\n".join(encontrados[:15])
-        else:
-            txt = "⚠️ No se encontraron activos de índices en los diccionarios digitales."
-
-        await msg.edit_text(txt, parse_mode=constants.ParseMode.MARKDOWN)
+        # Explorar diccionarios de inicialización de la API
+        if hasattr(api, "get_all_init"):
+            init = api.get_all_init()
+            if init and isinstance(init, dict) and "result" in init:
+                for categoria, cat_data in init["result"].items():
+                    if isinstance(cat_data, dict) and "actives" in cat_data:
+                        for act_id, act_info in cat_data["actives"].items():
+                            nombre = act_info.get("name", "")
+                            desc = act_info.get("description", "")
+                            full_txt = f"{nombre} {desc}".upper()
+                            if any(k in full_txt for k in ["GER", "AU 200", "AUS", "TRUMP", "BLITZ"]):
+                                encontrados.append(f"• `{nombre}` (ID: `{act_id}` | {categoria})")
     except Exception as e:
-        await msg.edit_text(f"❌ Error al consultar: {e}")
+        logging.error(f"Error en init: {e}")
 
-async def procesar_orden(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not encontrados:
+        # Escaneo directo en velas de índices
+        ahora = time.time()
+        candidatos_raw = ["GER 30", "GERMANY30", "GER30", "AU 200", "AUS200", "TRUMP Coin", "TRUMP"]
+        for c in candidatos_raw:
+            try:
+                velas = api.get_candles(c, 60, 1, ahora)
+                if velas and len(velas) > 0 and "close" in velas[0]:
+                    encontrados.append(f"• `{c}` (Cotizando a {velas[0]['close']})")
+            except Exception:
+                continue
+
+    if encontrados:
+        txt = "⚡ **Activos Blitz Detectados en Vivo:**\n\n" + "\n".join(encontrados[:15])
+    else:
+        txt = "⚠️ No se detectaron identificadores Blitz en la sesión actual."
+
+    await msg.edit_text(txt, parse_mode=constants.ParseMode.MARKDOWN)
+
+async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
     texto = update.message.text.strip().upper()
 
-    # 1. Dirección
+    # Dirección
     direccion = None
     if any(w in texto for w in ["CALL", "SUBE", "COMPRA", "HIGHER"]):
         direccion = "CALL"
@@ -200,11 +203,11 @@ async def procesar_orden(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not direccion:
         return
 
-    # 2. Activo
+    # Activo Blitz
     activo = None
-    if any(k in texto for k in ["GER30", "GERMANY", "GER 30", "DE30"]):
+    if any(k in texto for k in ["GER30", "GERMANY", "GER 30", "DE30", "GER"]):
         activo = "GER 30"
-    elif any(k in texto for k in ["AUS200", "AU200", "AU 200", "AUS 200"]):
+    elif any(k in texto for k in ["AUS200", "AU200", "AU 200", "AUS 200", "AU"]):
         activo = "AU 200"
     elif "TRUMP" in texto:
         activo = "TRUMP Coin"
@@ -212,7 +215,7 @@ async def procesar_orden(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tokens = re.findall(r"[A-Z0-9\-]+", texto)
         ignorar = ["EXEC", "CALL", "PUT", "SUBE", "BAJA", "COMPRA", "VENTA", "STATUS", "BLITZ", "30S", "60S", "30", "60"]
         for t in tokens:
-            if t not in ignorar and len(t) >= 3:
+            if t not in ignorar and len(t) >= 2:
                 activo = t
                 break
 
@@ -220,7 +223,7 @@ async def procesar_orden(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     logging.info(f"⚡ [DISPARO BLITZ]: {activo} {direccion}")
-    exito, info = await ejecutar_blitz_seguro(activo, direccion)
+    exito, info = await disparar_blitz_seguro(activo, direccion)
 
     estado = "✅" if exito else "⚠️"
     await update.message.reply_text(
@@ -236,6 +239,6 @@ if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("detectar", detectar_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_orden))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_mensaje))
 
     app.run_polling(drop_pending_updates=True)
