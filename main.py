@@ -81,24 +81,37 @@ def _ejecutar_en_broker(par, dir_iq, duracion_min):
 
     par_limpio = par.upper().replace("/", "").strip()
 
-    # Normalización de alias Blitz
-    if par_limpio in ["GER30", "GER 30", "GERMANY 30"]:
-        par_limpio = "GERMANY30"
-    elif par_limpio in ["AU200", "AU 200"]:
-        par_limpio = "AUS200"
+    # Normalización y fallback automático OTC <-> Mercado Abierto
+    candidatos = [par_limpio]
+    if "-OTC" in par_limpio:
+        candidatos.append(par_limpio.replace("-OTC", ""))
+    elif not any(idx in par_limpio for idx in ["GER", "AU", "US", "DE"]):
+        candidatos.append(f"{par_limpio}-OTC")
 
-    # Intento de disparo vía Turbo / Binaria directa (1 minuto estándar)
-    try:
-        ok, id_op = api.buy(TRADE_AMOUNT, par_limpio, dir_iq, duracion_min)
-        if ok and id_op:
-            return True, f"Orden #{id_op}"
-        return False, f"Rechazado por broker ({id_op})"
-    except Exception as err:
-        return False, f"Error ejecución: {err}"
+    # Mapeo de variantes reconocidas para índices Blitz
+    if any(k in par_limpio for k in ["GER30", "GERMANY", "GER 30"]):
+        candidatos = ["GER_30", "GERMANY30", "GER30", "DE30"]
+    elif any(k in par_limpio for k in ["AU200", "AUS200", "AU 200"]):
+        candidatos = ["AU_200", "AUS200", "AU200"]
+
+    ultimo_error = "Activo no disponible"
+
+    for p in candidatos:
+        try:
+            ok, id_op = api.buy(TRADE_AMOUNT, p, dir_iq, duracion_min)
+            if ok and isinstance(id_op, int):
+                return True, f"Orden #{id_op} en `{p}`"
+            elif ok and id_op:
+                return True, f"Orden #{id_op} en `{p}`"
+            else:
+                ultimo_error = str(id_op)
+        except Exception as err:
+            ultimo_error = str(err)
+
+    return False, f"Rechazado ({ultimo_error})"
 
 async def disparar_orden_segura(par, direccion, duracion_str):
     dir_iq = direccion.lower()
-    # Para 30s o 60s se asigna 1 minuto en la orden turbo
     duracion_min = 1
 
     try:
@@ -131,7 +144,7 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     texto = update.message.text.strip().upper()
 
-    # 1. Dirección
+    # 1. Identificar Dirección
     direccion = None
     if any(w in texto for w in ["CALL", "SUBE", "COMPRA"]):
         direccion = "CALL"
@@ -141,10 +154,10 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not direccion:
         return
 
-    # 2. Duración
+    # 2. Identificar Duración
     duracion = "30S" if any(w in texto for w in ["30S", "30 S", "BLITZ", " 30"]) else "60S"
 
-    # 3. Activo
+    # 3. Identificar Activo
     par = None
     if any(k in texto for k in ["GERMANY30", "GER30", "GER 30"]):
         par = "GERMANY30"
