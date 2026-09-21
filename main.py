@@ -52,7 +52,7 @@ api = None
 def conectar_iq():
     global api
     try:
-        logging.info(f"⚡ Conectando a IQ Option ({IQ_USER})...")
+        logging.info(f"⚡ Conectando motor Blitz a IQ Option ({IQ_USER})...")
         cliente = IQ_Option(IQ_USER.strip(), IQ_PASS.strip())
         ok, reason = cliente.connect()
         if ok:
@@ -64,7 +64,7 @@ def conectar_iq():
             logging.error(f"❌ Error al conectar a IQ: {reason}")
             return False
     except Exception as e:
-        logging.error(f"❌ Excepción: {e}")
+        logging.error(f"❌ Excepción durante la conexión: {e}")
         return False
 
 def asegurar_sesion():
@@ -73,21 +73,21 @@ def asegurar_sesion():
         return conectar_iq()
     return True
 
-# ================= 4. MAPEO EXACTO DE ACTIVOS BLITZ =================
-# Mapeo directo a los identificadores verificados en backend
-MAPA_BLITZ = {
-    "GER30": "GER30-OTC",
-    "GER 30": "GER30-OTC",
-    "GERMANY30": "GER30-OTC",
-    "GER30-OTC": "GER30-OTC",
-    "AU200": "AUS200-OTC",
-    "AU 200": "AUS200-OTC",
-    "AUS200": "AUS200-OTC",
-    "AUS200-OTC": "AUS200-OTC",
-    "TRUMP": "TRUMPUSD-OTC",
-    "TRUMP COIN": "TRUMPUSD-OTC",
-    "TRUMPUSD": "TRUMPUSD-OTC",
-    "TRUMPUSD-OTC": "TRUMPUSD-OTC",
+# ================= 4. MAPA DE IDs NUMÉRICOS BLITZ =================
+# IDs extraídos directamente de la inicialización de IQ Option
+BLITZ_IDS = {
+    "GER30": 2046,
+    "GER 30": 2046,
+    "GERMANY30": 2046,
+    "GER30-OTC": 2046,
+    "AU200": 2048,
+    "AU 200": 2048,
+    "AUS200": 2048,
+    "AUS200-OTC": 2048,
+    "TRUMP": 2265,
+    "TRUMPUSD": 2265,
+    "TRUMPUSD-OTC": 2265,
+    "TRUMP COIN": 2265,
 }
 
 def _disparar_blitz_en_broker(activo_input, dir_iq):
@@ -96,25 +96,58 @@ def _disparar_blitz_en_broker(activo_input, dir_iq):
         return False, "Broker desconectado"
 
     raw = activo_input.upper().replace("/", "").strip()
-    activo_real = MAPA_BLITZ.get(raw, raw)
+    active_id = BLITZ_IDS.get(raw)
 
-    # Lista de variantes a intentar en orden de prioridad
-    candidatos = [activo_real]
-    if "GER" in raw:
-        candidatos = ["GER30-OTC", 2046, "GERMANY30"]
-    elif "AU" in raw:
-        candidatos = ["AUS200-OTC", 2048, "AUS200:N"]
-    elif "TRUMP" in raw:
-        candidatos = ["TRUMPUSD-OTC", 2265, "TRUMP"]
+    # Identificación automática si no coincide la clave exacta
+    if not active_id:
+        if "GER" in raw:
+            active_id = 2046
+        elif "AU" in raw:
+            active_id = 2048
+        elif "TRUMP" in raw:
+            active_id = 2265
 
-    ultimo_err = "Sin respuesta"
+    ultimo_err = "No disponible"
 
-    for act in candidatos:
+    # 1. Ejecución directa por ID numérico en el WebSocket (Ruta Blitz Nativa)
+    if active_id:
         try:
-            # Disparo directo mediante Turbo (duración base de 1 minuto)
-            ok, id_op = api.buy(TRADE_AMOUNT, act, dir_iq, 1)
+            # Duración turbo de 1 minuto sobre el ID numérico
+            exp = int(api.get_server_timestamp()) + 60
+            api.buy_by_raw_expired(TRADE_AMOUNT, active_id, dir_iq, exp)
+            time.sleep(0.35)
+            
+            # Verificar si se abrió la posición
+            pos = api.get_option_open_by_other_pc()
+            if pos:
+                return True, f"Blitz Ejecutado (ID: `{active_id}`)"
+        except Exception as e:
+            ultimo_err = str(e)
+
+        # Intento directo por buy estándar pasando el ID como número
+        try:
+            ok, id_op = api.buy(TRADE_AMOUNT, active_id, dir_iq, 1)
             if ok and (isinstance(id_op, int) or id_op):
-                return True, f"Blitz #{id_op} en `{act}`"
+                return True, f"Blitz #{id_op} en ID `{active_id}`"
+            elif id_op:
+                ultimo_err = str(id_op)
+        except Exception as e:
+            ultimo_err = str(e)
+
+    # 2. Intento de respaldo con nombres de texto
+    candidatos_str = [raw]
+    if "GER" in raw:
+        candidatos_str = ["GER30-OTC", "GER 30", "GERMANY30"]
+    elif "AU" in raw:
+        candidatos_str = ["AUS200-OTC", "AU 200", "AUS200"]
+    elif "TRUMP" in raw:
+        candidatos_str = ["TRUMPUSD-OTC", "TRUMP"]
+
+    for nom in candidatos_str:
+        try:
+            ok, id_op = api.buy(TRADE_AMOUNT, nom, dir_iq, 1)
+            if ok and (isinstance(id_op, int) or id_op):
+                return True, f"Blitz #{id_op} en `{nom}`"
             else:
                 ultimo_err = str(id_op)
         except Exception as e:
@@ -168,11 +201,11 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 2. Identificación del activo
     activo = None
     if any(k in texto for k in ["GER30", "GERMANY", "GER 30", "GER"]):
-        activo = "GER30-OTC"
+        activo = "GER 30"
     elif any(k in texto for k in ["AUS200", "AU200", "AU 200", "AUS"]):
-        activo = "AUS200-OTC"
+        activo = "AU 200"
     elif "TRUMP" in texto:
-        activo = "TRUMPUSD-OTC"
+        activo = "TRUMP"
     else:
         tokens = re.findall(r"[A-Z0-9\-]+", texto)
         ignorar = ["EXEC", "CALL", "PUT", "SUBE", "BAJA", "COMPRA", "VENTA", "STATUS", "BLITZ", "30S", "60S", "30", "60"]
