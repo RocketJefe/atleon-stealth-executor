@@ -29,7 +29,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-# ================= 2. KEEPALIVE HTTP =================
+# ================= 2. SERVIDOR KEEPALIVE HTTP =================
 class KeepAliveHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -46,7 +46,7 @@ def run_web():
     server = HTTPServer(("0.0.0.0", port), KeepAliveHandler)
     server.serve_forever()
 
-# ================= 3. CONEXIÓN IQ OPTION =================
+# ================= 3. CONEXIÓN A IQ OPTION =================
 api = None
 
 def conectar_iq():
@@ -61,7 +61,7 @@ def conectar_iq():
             logging.info(f"⚡ [BLITZ ENGINE LISTO] Saldo: ${api.get_balance():.2f}")
             return True
         else:
-            logging.error(f"❌ Error al conectar: {reason}")
+            logging.error(f"❌ Error al conectar a IQ: {reason}")
             return False
     except Exception as e:
         logging.error(f"❌ Excepción: {e}")
@@ -73,59 +73,64 @@ def asegurar_sesion():
         return conectar_iq()
     return True
 
-# ================= 4. MOTOR EXCLUSIVO BLITZ =================
-def _disparar_blitz(activo_str, dir_iq):
+# ================= 4. MAPEO EXACTO DE ACTIVOS BLITZ =================
+# Mapeo directo a los identificadores verificados en backend
+MAPA_BLITZ = {
+    "GER30": "GER30-OTC",
+    "GER 30": "GER30-OTC",
+    "GERMANY30": "GER30-OTC",
+    "GER30-OTC": "GER30-OTC",
+    "AU200": "AUS200-OTC",
+    "AU 200": "AUS200-OTC",
+    "AUS200": "AUS200-OTC",
+    "AUS200-OTC": "AUS200-OTC",
+    "TRUMP": "TRUMPUSD-OTC",
+    "TRUMP COIN": "TRUMPUSD-OTC",
+    "TRUMPUSD": "TRUMPUSD-OTC",
+    "TRUMPUSD-OTC": "TRUMPUSD-OTC",
+}
+
+def _disparar_blitz_en_broker(activo_input, dir_iq):
     global api
     if not asegurar_sesion():
         return False, "Broker desconectado"
 
-    raw = activo_str.upper().replace("/", "").strip()
+    raw = activo_input.upper().replace("/", "").strip()
+    activo_real = MAPA_BLITZ.get(raw, raw)
 
-    # Opciones de nombres probables para Blitz en el backend
-    candidatos = [raw]
-    if any(k in raw for k in ["GER", "GERMANY", "DE"]):
-        candidatos = ["GER 30", "GER30", "GER_30", "GERMANY30", "DE30", "1232"]
-    elif any(k in raw for k in ["AU", "AUS"]):
-        candidatos = ["AU 200", "AU200", "AU_200", "AUS200", "1234"]
+    # Lista de variantes a intentar en orden de prioridad
+    candidatos = [activo_real]
+    if "GER" in raw:
+        candidatos = ["GER30-OTC", 2046, "GERMANY30"]
+    elif "AU" in raw:
+        candidatos = ["AUS200-OTC", 2048, "AUS200:N"]
     elif "TRUMP" in raw:
-        candidatos = ["TRUMP Coin", "TRUMP", "TRUMP_COIN"]
+        candidatos = ["TRUMPUSD-OTC", 2265, "TRUMP"]
 
-    ultimo_error = "Sin respuesta"
+    ultimo_err = "Sin respuesta"
 
-    # Intento 1: Disparo Turbo directo (Blitz se enruta como contrato turbo de corta duración)
     for act in candidatos:
         try:
+            # Disparo directo mediante Turbo (duración base de 1 minuto)
             ok, id_op = api.buy(TRADE_AMOUNT, act, dir_iq, 1)
             if ok and (isinstance(id_op, int) or id_op):
-                return True, f"Blitz Directo #{id_op} en `{act}`"
+                return True, f"Blitz #{id_op} en `{act}`"
             else:
-                ultimo_error = str(id_op)
+                ultimo_err = str(id_op)
         except Exception as e:
-            ultimo_error = str(e)
+            ultimo_err = str(e)
 
-    # Intento 2: Disparo Digital Spot con suscripción previa
-    for act in candidatos:
-        try:
-            api.subscribe_strike_list(act, 1)
-            time.sleep(0.35)
-            ok, id_op = api.buy_digital_spot(act, TRADE_AMOUNT, dir_iq, 1)
-            if ok and id_op:
-                api.unsubscribe_strike_list(act, 1)
-                return True, f"Blitz Spot #{id_op} en `{act}`"
-        except Exception as e:
-            ultimo_error = str(e)
-
-    return False, f"Rechazado ({ultimo_error})"
+    return False, f"Rechazado ({ultimo_err})"
 
 async def disparar_blitz_seguro(activo, direccion):
     dir_iq = direccion.lower()
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(_disparar_blitz, activo, dir_iq),
-            timeout=4.5
+            asyncio.to_thread(_disparar_blitz_en_broker, activo, dir_iq),
+            timeout=4.0
         )
     except asyncio.TimeoutError:
-        return False, "Timeout: Broker no devolvió confirmación en 4.5s"
+        return False, "Timeout en broker (4s)"
     except Exception as e:
         return False, str(e)
 
@@ -144,56 +149,13 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Sin conexión con IQ Option.")
 
-async def detectar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not asegurar_sesion():
-        await update.message.reply_text("❌ Broker desconectado.")
-        return
-
-    msg = await update.message.reply_text("🔍 Rastreando activos Blitz en la memoria de IQ...")
-    encontrados = []
-    
-    try:
-        # Explorar diccionarios de inicialización de la API
-        if hasattr(api, "get_all_init"):
-            init = api.get_all_init()
-            if init and isinstance(init, dict) and "result" in init:
-                for categoria, cat_data in init["result"].items():
-                    if isinstance(cat_data, dict) and "actives" in cat_data:
-                        for act_id, act_info in cat_data["actives"].items():
-                            nombre = act_info.get("name", "")
-                            desc = act_info.get("description", "")
-                            full_txt = f"{nombre} {desc}".upper()
-                            if any(k in full_txt for k in ["GER", "AU 200", "AUS", "TRUMP", "BLITZ"]):
-                                encontrados.append(f"• `{nombre}` (ID: `{act_id}` | {categoria})")
-    except Exception as e:
-        logging.error(f"Error en init: {e}")
-
-    if not encontrados:
-        # Escaneo directo en velas de índices
-        ahora = time.time()
-        candidatos_raw = ["GER 30", "GERMANY30", "GER30", "AU 200", "AUS200", "TRUMP Coin", "TRUMP"]
-        for c in candidatos_raw:
-            try:
-                velas = api.get_candles(c, 60, 1, ahora)
-                if velas and len(velas) > 0 and "close" in velas[0]:
-                    encontrados.append(f"• `{c}` (Cotizando a {velas[0]['close']})")
-            except Exception:
-                continue
-
-    if encontrados:
-        txt = "⚡ **Activos Blitz Detectados en Vivo:**\n\n" + "\n".join(encontrados[:15])
-    else:
-        txt = "⚠️ No se detectaron identificadores Blitz en la sesión actual."
-
-    await msg.edit_text(txt, parse_mode=constants.ParseMode.MARKDOWN)
-
 async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
     texto = update.message.text.strip().upper()
 
-    # Dirección
+    # 1. Dirección
     direccion = None
     if any(w in texto for w in ["CALL", "SUBE", "COMPRA", "HIGHER"]):
         direccion = "CALL"
@@ -203,14 +165,14 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not direccion:
         return
 
-    # Activo Blitz
+    # 2. Identificación del activo
     activo = None
-    if any(k in texto for k in ["GER30", "GERMANY", "GER 30", "DE30", "GER"]):
-        activo = "GER 30"
-    elif any(k in texto for k in ["AUS200", "AU200", "AU 200", "AUS 200", "AU"]):
-        activo = "AU 200"
+    if any(k in texto for k in ["GER30", "GERMANY", "GER 30", "GER"]):
+        activo = "GER30-OTC"
+    elif any(k in texto for k in ["AUS200", "AU200", "AU 200", "AUS"]):
+        activo = "AUS200-OTC"
     elif "TRUMP" in texto:
-        activo = "TRUMP Coin"
+        activo = "TRUMPUSD-OTC"
     else:
         tokens = re.findall(r"[A-Z0-9\-]+", texto)
         ignorar = ["EXEC", "CALL", "PUT", "SUBE", "BAJA", "COMPRA", "VENTA", "STATUS", "BLITZ", "30S", "60S", "30", "60"]
@@ -238,7 +200,6 @@ if __name__ == "__main__":
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("detectar", detectar_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_mensaje))
 
     app.run_polling(drop_pending_updates=True)
