@@ -29,11 +29,12 @@ TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 api = None
 lock = threading.Lock()
 
-# ================= CONEXIÓN PERSISTENTE =================
+# ================= CONEXIÓN IQ OPTION =================
 def conectar():
     global api
     with lock:
         try:
+            print(f"[IQ] Conectando con usuario {IQ_USER}...")
             cliente = IQ_Option(IQ_USER, IQ_PASS)
             ok, motivo = cliente.connect()
             if ok:
@@ -54,20 +55,19 @@ def asegurar_sesion():
 # ================= MOTOR DE DISPARO =================
 def disparar(par, direccion, duracion):
     if not asegurar_sesion():
-        return False, "Broker no disponible"
+        return False, "Broker desconectado"
 
     dir_iq = direccion.lower()
     par_limpio = par.upper().replace("/", "").strip()
 
-    # Normalización para índices Blitz
+    # Normalización de alias
     if par_limpio in ["GER30", "GER 30", "GERMANY30"]:
         par_limpio = "GERMANY30"
     elif par_limpio in ["AU200", "AU 200", "AUS200"]:
         par_limpio = "AUS200"
 
-    # 1. Modalidad Blitz 30s
+    # Modalidad Blitz 30s
     if "30" in str(duracion):
-        # Intento vía Digital Spot (30s)
         try:
             ok, id_op = api.buy_digital_spot(par_limpio, TRADE_AMOUNT, dir_iq, 30)
             if ok and id_op:
@@ -75,7 +75,7 @@ def disparar(par, direccion, duracion):
         except Exception as e:
             print(f"[DIGITAL ERR]: {e}")
 
-        # Fallback a Binarias 1m si Digital Spot no está abierto
+        # Fallback a binaria 1m si Digital Spot no responde
         try:
             ok, id_op = api.buy(TRADE_AMOUNT, par_limpio, dir_iq, 1)
             if ok and id_op:
@@ -84,7 +84,7 @@ def disparar(par, direccion, duracion):
         except Exception as err:
             return False, str(err)
 
-    # 2. Modalidad Binarias 60s (Forex / OTC)
+    # Modalidad Binarias 60s (Forex / OTC)
     else:
         try:
             ok, id_op = api.buy(TRADE_AMOUNT, par_limpio, dir_iq, 1)
@@ -94,15 +94,56 @@ def disparar(par, direccion, duracion):
         except Exception as err:
             return False, str(err)
 
-# ================= ESCUCHA SILENCIOSA CON REGEX =================
+# ================= PARSER UNIVERSAL =================
+def parsear_texto(texto):
+    texto_upper = texto.upper()
+
+    # 1. Dirección
+    direccion = None
+    if any(k in texto_upper for k in ["CALL", "SUBE", "COMPRA", "HIGHER"]):
+        direccion = "call"
+    elif any(k in texto_upper for k in ["PUT", "BAJA", "VENTA", "LOWER"]):
+        direccion = "put"
+
+    if not direccion:
+        return None, None, None
+
+    # 2. Duración
+    duracion = "60S"
+    if any(k in texto_upper for k in ["30S", "30 S", "BLITZ", "30SEG", "30 SEG"]):
+        duracion = "30S"
+    elif any(k in texto_upper for k in ["60S", "60 S", "1M", "1 MIN", "60SEG"]):
+        duracion = "60S"
+
+    # 3. Activo
+    activo = None
+    if "GER30" in texto_upper or "GERMANY30" in texto_upper or "GER 30" in texto_upper:
+        activo = "GERMANY30"
+    elif "AU200" in texto_upper or "AUS200" in texto_upper or "AU 200" in texto_upper:
+        activo = "AUS200"
+    elif "TRUMP" in texto_upper:
+        activo = "TRUMP"
+    else:
+        # Busca cualquier par tipo EURUSD-OTC o GBPUSD
+        match_par = re.search(r"\b([A-Z0-9]{3,6}(?:-OTC)?)\b", texto_upper)
+        ignorar = ["EXEC", "CALL", "PUT", "SUBE", "BAJA", "COMPRA", "VENTA", "STATUS", "BLITZ", "30S", "60S"]
+        if match_par and match_par.group(1) not in ignorar:
+            activo = match_par.group(1)
+
+    return activo, direccion, duracion
+
+# ================= RECEPTOR TELEGRAM =================
 def listener():
-    try:
-        requests.get(f"{TG_API}/deleteWebhook?drop_pending_updates=True", timeout=5)
-    except Exception:
-        pass
+    # Limpieza rigurosa de webhook residual
+    for _ in range(3):
+        try:
+            requests.get(f"{TG_API}/deleteWebhook?drop_pending_updates=True", timeout=5)
+            break
+        except Exception:
+            time.sleep(1)
 
     last_id = 0
-    print("👂 Escuchando señales en segundo plano...")
+    print("👂 [RECEPTOR] Escuchando mensajes en tiempo real...")
 
     while True:
         try:
@@ -119,9 +160,10 @@ def listener():
 
                 texto = msg["text"].strip()
                 chat_id = msg["chat"]["id"]
+                print(f"[RECEPTOR TG MSG]: {texto}")
 
-                # Estado
-                if texto.upper() == "/STATUS":
+                # Diagnóstico
+                if texto.upper().startswith("/STATUS"):
                     asegurar_sesion()
                     saldo = f"${api.get_balance():.2f}" if (api and api.check_connect()) else "Desconectado"
                     requests.post(f"{TG_API}/sendMessage", json={
@@ -130,23 +172,19 @@ def listener():
                     }, timeout=5)
                     continue
 
-                # Detección flexible mediante Expresión Regular
-                # Captura cualquier mensaje que contenga EXEC seguido del par, CALL/PUT y duración opcional
-                match = re.search(r"EXEC\s+([A-Z0-9_\-]+)\s+(CALL|PUT|SUBE|BAJA)(?:\s+(\d+\s*[SM]?))?", texto, re.IGNORECASE)
-                if match:
-                    par = match.group(1).strip().upper()
-                    dir_raw = match.group(2).strip().upper()
-                    direccion = "call" if dir_raw in ["CALL", "SUBE"] else "put"
-                    duracion = match.group(3) if match.group(3) else "60S"
+                # Procesar cualquier orden
+                par, direccion, duracion = parsear_texto(texto)
+                if not par or not direccion:
+                    continue
 
-                    print(f"⚡ [ORDEN DETECTADA] {par} | {direccion} | {duracion}")
-                    exito, info = disparar(par, direccion, duracion)
+                print(f"⚡ [DISPARANDO]: {par} | {direccion.upper()} | {duracion}")
+                exito, info = disparar(par, direccion, duracion)
 
-                    estado = "✅" if exito else "⚠️"
-                    requests.post(f"{TG_API}/sendMessage", json={
-                        "chat_id": chat_id,
-                        "text": f"{estado} `{par}` {direccion.upper()} ({duracion}) -> {info}"
-                    }, timeout=5)
+                estado = "✅" if exito else "⚠️"
+                requests.post(f"{TG_API}/sendMessage", json={
+                    "chat_id": chat_id,
+                    "text": f"{estado} `{par}` {direccion.upper()} ({duracion}) -> {info}"
+                }, timeout=5)
 
         except Exception as e:
             print(f"[LOOP EXCEPTION]: {e}")
