@@ -29,7 +29,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-# ================= 2. KEEPALIVE HTTP (RENDER) =================
+# ================= 2. SERVIDOR KEEPALIVE HTTP (RENDER) =================
 class KeepAliveHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -73,48 +73,46 @@ def asegurar_sesion():
         return conectar_iq()
     return True
 
-# ================= 4. MOTOR EXCLUSIVO BLITZ 30S =================
+# ================= 4. MOTOR EXCLUSIVO BLITZ =================
 def _disparar_blitz_en_broker(activo, dir_iq):
     global api
     if not asegurar_sesion():
         return False, "Broker desconectado"
 
-    # 1. Normalización estricta de nombres Blitz de IQ Option
-    activo_normalizado = activo.upper().replace("/", "").replace(" ", "").strip()
-    if any(k in activo_normalizado for k in ["GER", "GERMANY"]):
-        activo_normalizado = "GERMANY30"
-    elif any(k in activo_normalizado for k in ["AU", "AUS"]):
-        activo_normalizado = "AUS200"
-    elif "TRUMP" in activo_normalizado:
-        activo_normalizado = "TRUMP"
+    activo_raw = activo.upper().replace("/", "").replace(" ", "").strip()
 
-    # 2. Suscribir stream de strikes y asegurar sincronización en WebSocket
-    try:
-        api.subscribe_strike_list(activo_normalizado, 30)
-    except Exception as e:
-        logging.warning(f"Error en subscribe_strike_list: {e}")
+    # Nombres reconocidos en IQ Option para Blitz / Índices
+    candidatos = [activo_raw]
+    if any(k in activo_raw for k in ["GER", "GERMANY"]):
+        candidatos = ["GERMANY30", "GER30", "GER_30"]
+    elif any(k in activo_raw for k in ["AU", "AUS"]):
+        candidatos = ["AUS200", "AU200", "AU_200"]
 
-    # Breve espera de sincronización de ticks en memoria
-    time.sleep(0.5)
+    ultimo_error = "Sin respuesta de strike"
 
-    # 3. Disparo Digital Spot / Blitz
-    try:
-        # Intento con duración 30 segundos
-        ok, id_op = api.buy_digital_spot(activo_normalizado, TRADE_AMOUNT, dir_iq, 30)
-        if ok and id_op:
-            return True, f"Blitz 30s #{id_op}"
-    except Exception as e:
-        logging.error(f"Error buy_digital_spot: {e}")
+    for act in candidatos:
+        try:
+            # Suscripción obligatoria de strikes en escala de 1m (base del motor digital)
+            api.subscribe_strike_list(act, 1)
+            time.sleep(0.35)
 
-    # Intento con endpoint v2 de digital spot para Blitz
-    try:
-        ok, id_op = api.buy_digital_spot_v2(activo_normalizado, TRADE_AMOUNT, dir_iq, 30)
-        if ok and id_op:
-            return True, f"Blitz SpotV2 #{id_op}"
-    except Exception as e:
-        logging.error(f"Error buy_digital_spot_v2: {e}")
+            # Intento 1: Digital Spot estándar
+            ok, id_op = api.buy_digital_spot(act, TRADE_AMOUNT, dir_iq, 1)
+            if ok and id_op:
+                api.unsubscribe_strike_list(act, 1)
+                return True, f"Blitz Spot #{id_op} en `{act}`"
+        except Exception as e:
+            ultimo_error = str(e)
 
-    return False, f"Activo Blitz `{activo_normalizado}` no devolvió ID"
+        try:
+            # Intento 2: Digital Spot V2
+            ok, id_op = api.buy_digital_spot_v2(act, TRADE_AMOUNT, dir_iq, 1)
+            if ok and id_op:
+                return True, f"Blitz SpotV2 #{id_op} en `{act}`"
+        except Exception as e:
+            ultimo_error = str(e)
+
+    return False, f"Rechazado en broker ({ultimo_error})"
 
 async def ejecutar_blitz_seguro(activo, direccion):
     dir_iq = direccion.lower()
@@ -124,7 +122,7 @@ async def ejecutar_blitz_seguro(activo, direccion):
             timeout=4.5
         )
     except asyncio.TimeoutError:
-        return False, "Timeout: IQ Option no confirmó el strike Blitz en 4.5s"
+        return False, "Timeout: Broker no devolvió confirmación en 4.5s"
     except Exception as e:
         return False, str(e)
 
@@ -134,7 +132,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         saldo = api.get_balance()
         await update.message.reply_text(
             f"⚡ **Atleon Stealth Blitz Executor**\n"
-            f"• Estado: 🟢 Operativo (Modo Blitz 30s)\n"
+            f"• Estado: 🟢 Operativo (Modo Blitz)\n"
             f"• Saldo: `${saldo:.2f}`\n"
             f"• Cuenta: `{IQ_ACCOUNT_TYPE}`\n"
             f"• Monto por Trade: `${TRADE_AMOUNT:.2f}`",
@@ -143,30 +141,30 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Sin conexión con IQ Option.")
 
-async def blitz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def blitzinfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not asegurar_sesion():
         await update.message.reply_text("❌ Broker desconectado.")
         return
 
-    msg = await update.message.reply_text("🔍 Escaneando activos Blitz disponibles...")
-    candidatos_blitz = ["GERMANY30", "AUS200", "US30", "TRUMP"]
-    activos_ok = []
+    msg = await update.message.reply_text("🔍 Consultando cotizaciones de activos Blitz...")
+    indices = ["GERMANY30", "AUS200", "US30", "TRUMP"]
+    activos_encontrados = []
     ahora = time.time()
 
-    for act in candidatos_blitz:
+    for ind in indices:
         try:
-            candles = api.get_candles(act, 60, 1, ahora)
-            if candles and len(candles) > 0:
-                activos_ok.append(act)
+            c = api.get_candles(ind, 60, 1, ahora)
+            if c and len(c) > 0 and "close" in c[0]:
+                activos_encontrados.append(f"`{ind}` ({c[0]['close']})")
         except Exception:
             continue
 
-    if activos_ok:
-        texto = "⚡ **Activos Blitz con Cotización Activa:**\n\n" + ", ".join([f"`{a}`" for a in activos_ok])
+    if activos_encontrados:
+        txt = "⚡ **Activos Blitz con flujo en vivo:**\n\n" + "\n".join(activos_encontrados)
     else:
-        texto = "⚠️ No se detectaron cotizaciones Blitz activas en este instante."
+        txt = "⚠️ No se recibieron velas activas de índices Blitz."
 
-    await msg.edit_text(texto, parse_mode=constants.ParseMode.MARKDOWN)
+    await msg.edit_text(txt, parse_mode=constants.ParseMode.MARKDOWN)
 
 async def procesar_orden_blitz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
@@ -174,7 +172,7 @@ async def procesar_orden_blitz(update: Update, context: ContextTypes.DEFAULT_TYP
 
     texto = update.message.text.strip().upper()
 
-    # 1. Dirección obligatoria
+    # 1. Dirección
     direccion = None
     if any(w in texto for w in ["CALL", "SUBE", "COMPRA", "HIGHER"]):
         direccion = "CALL"
@@ -184,7 +182,7 @@ async def procesar_orden_blitz(update: Update, context: ContextTypes.DEFAULT_TYP
     if not direccion:
         return
 
-    # 2. Identificar el activo Blitz
+    # 2. Activo
     activo = None
     if any(k in texto for k in ["GER30", "GERMANY", "GER 30", "DE30"]):
         activo = "GERMANY30"
@@ -205,12 +203,12 @@ async def procesar_orden_blitz(update: Update, context: ContextTypes.DEFAULT_TYP
     if not activo:
         return
 
-    logging.info(f"⚡ [DISPARO BLITZ]: {activo} {direccion} (30s)")
+    logging.info(f"⚡ [DISPARO BLITZ]: {activo} {direccion}")
     exito, info = await ejecutar_blitz_seguro(activo, direccion)
 
     estado = "✅" if exito else "⚠️"
     await update.message.reply_text(
-        f"{estado} ⚡ **BLITZ 30S** | `{activo}` {direccion} ➔ {info}",
+        f"{estado} ⚡ **BLITZ** | `{activo}` {direccion} ➔ {info}",
         parse_mode=constants.ParseMode.MARKDOWN
     )
 
@@ -221,7 +219,7 @@ if __name__ == "__main__":
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("blitz", blitz_cmd))
+    app.add_handler(CommandHandler("blitzinfo", blitzinfo_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_orden_blitz))
 
     app.run_polling(drop_pending_updates=True)
