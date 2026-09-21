@@ -1,7 +1,6 @@
 import os
 import re
 import time
-import json
 import logging
 import asyncio
 from threading import Thread
@@ -47,7 +46,7 @@ def run_web():
     server = HTTPServer(("0.0.0.0", port), KeepAliveHandler)
     server.serve_forever()
 
-# ================= 3. CONEXIÓN A IQ OPTION =================
+# ================= 3. CONEXIÓN PERSISTENTE IQ OPTION =================
 api = None
 
 def conectar_iq():
@@ -74,8 +73,7 @@ def asegurar_sesion():
         return conectar_iq()
     return True
 
-# ================= 4. MOTOR BLITZ DIRECTO POR WEBSOCKET =================
-# IDs verificados directamente de la sesión activa de IQ Option
+# ================= 4. MOTOR BLITZ POR ID DIRECTO =================
 BLITZ_REGISTRY = {
     "GER": {"id": 2046, "name": "GER 30 Blitz"},
     "GERMANY": {"id": 2046, "name": "GER 30 Blitz"},
@@ -92,7 +90,6 @@ def _disparar_blitz_nativo(activo_raw, dir_iq):
 
     raw = activo_raw.upper().replace("/", "").strip()
     
-    # Identificar ID numérico correspondiente
     target = None
     for key, data in BLITZ_REGISTRY.items():
         if key in raw:
@@ -100,47 +97,38 @@ def _disparar_blitz_nativo(activo_raw, dir_iq):
             break
 
     if not target:
-        target = {"id": 2046, "name": "GER 30 Blitz"}  # Default a GER 30
+        target = {"id": 2046, "name": "GER 30 Blitz"}
 
     active_id = target["id"]
     display_name = target["name"]
     dir_str = "call" if "call" in dir_iq.lower() or "sube" in dir_iq.lower() else "put"
 
-    # Inyección directa por paquete WebSocket para saltar el filtro de la librería
+    # Intento 1: Llamada al WebSocket subyacente mediante open_option
     try:
-        user_balance_id = api.profile.balance_id
-        server_time = int(api.get_server_timestamp())
-        exp_time = server_time + 30  # Expiración Blitz 30s
-
-        # Formato de mensaje nativo Blitz / Turbo
-        payload = {
-            "name": "binary-options.open-option",
-            "version": "1.0",
-            "body": {
-                "user_balance_id": user_balance_id,
-                "active_id": active_id,
-                "option_type_id": 3,  # Turbo / Blitz contract
-                "direction": dir_str,
-                "expired": exp_time,
-                "refund_value": 0,
-                "price": TRADE_AMOUNT,
-                "value": 0
-            }
-        }
-        
-        # Envío crudo por WebSocket
-        api.api.send_websocket(json.dumps(payload))
-        time.sleep(0.4)
-        
-        return True, f"Orden enviada a `{display_name}` (ID: `{active_id}`)"
+        if hasattr(api.api, "open_option"):
+            # Expiración a 30 segundos
+            exp_time = int(api.get_server_timestamp()) + 30
+            api.api.open_option(active_id, TRADE_AMOUNT, dir_str, 3, exp_time)
+            time.sleep(0.35)
+            return True, f"Blitz disparado en `{display_name}` (ID `{active_id}`)"
     except Exception as e:
-        # Fallback usando el método de expiración directa
-        try:
-            exp = int(api.get_server_timestamp()) + 30
-            api.buy_by_raw_expired(TRADE_AMOUNT, active_id, dir_str, exp)
-            return True, f"Orden directa inyectada en `{display_name}`"
-        except Exception as ex:
-            return False, f"Fallo al inyectar: {ex}"
+        logging.warning(f"Fallo open_option: {e}")
+
+    # Intento 2: Inyección mediante buy_by_raw_expired con nombre de método exacto
+    try:
+        if hasattr(api, "buy_by_raw_expired"):
+            exp_time = int(api.get_server_timestamp()) + 30
+            api.buy_by_raw_expired(TRADE_AMOUNT, active_id, dir_str, exp_time)
+            return True, f"Blitz orden colocada en `{display_name}`"
+    except Exception as e:
+        logging.warning(f"Fallo buy_by_raw_expired: {e}")
+
+    # Intento 3: Disparo por buy_order de la API interna
+    try:
+        api.api.buy_order(active_id, TRADE_AMOUNT, dir_str, 1)
+        return True, f"Blitz buy_order enviado a `{display_name}`"
+    except Exception as e:
+        return False, f"Rechazado en broker: {e}"
 
 async def ejecutar_blitz_seguro(activo, direccion):
     try:
@@ -149,7 +137,7 @@ async def ejecutar_blitz_seguro(activo, direccion):
             timeout=3.5
         )
     except asyncio.TimeoutError:
-        return False, "Timeout: Petición enviada al socket"
+        return False, "Timeout en conexión"
     except Exception as e:
         return False, str(e)
 
@@ -184,7 +172,7 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not direccion:
         return
 
-    # 2. Identificar el activo Blitz
+    # 2. Identificar activo
     activo = "GER 30"
     if any(k in texto for k in ["GER30", "GERMANY", "GER 30", "GER"]):
         activo = "GER 30"
@@ -193,7 +181,7 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif "TRUMP" in texto:
         activo = "TRUMP"
 
-    logging.info(f"⚡ [DISPARO BLITZ DIRECTO]: {activo} {direccion}")
+    logging.info(f"⚡ [DISPARO BLITZ]: {activo} {direccion}")
     exito, info = await ejecutar_blitz_seguro(activo, direccion)
 
     estado = "✅" if exito else "⚠️"
