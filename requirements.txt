@@ -1,5 +1,5 @@
 flask
-requests
+python-telegram-bot
 python-dotenv
 websocket-client==0.56.0
 git+https://github.com/Lu-Yi-Hsun/iqoptionapi.git@master
