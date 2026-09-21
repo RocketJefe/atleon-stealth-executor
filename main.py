@@ -81,34 +81,37 @@ def _ejecutar_en_broker(par, dir_iq, duracion):
 
     par_limpio = par.upper().replace("/", "").strip()
     
-    # Normalización de índices
-    if par_limpio in ["GER30", "GER 30", "GERMANY30"]:
-        par_limpio = "GERMANY30"
-    elif par_limpio in ["AU200", "AU 200", "AUS200"]:
-        par_limpio = "AUS200"
+    # Lista de nombres posibles para el índice Blitz
+    variantes = [par_limpio]
+    if "GER" in par_limpio:
+        variantes = ["GERMANY30", "GER30", "GER 30"]
+    elif "AU" in par_limpio:
+        variantes = ["AUS200", "AU200", "AU 200"]
 
     # MODO BLITZ (30s)
     if "30" in str(duracion):
-        try:
-            # Precarga y suscripción al flujo de strikes requerido por Digital Spot
-            api.subscribe_strike_list(par_limpio, 30)
-            time.sleep(0.4)
-            
-            ok, id_op = api.buy_digital_spot(par_limpio, TRADE_AMOUNT, dir_iq, 30)
-            if ok and id_op:
-                api.unsubscribe_strike_list(par_limpio, 30)
-                return True, f"Blitz 30s #{id_op}"
-        except Exception as e:
-            logging.warning(f"Digital Spot no completado en {par_limpio}: {e}")
+        for v in variantes:
+            try:
+                # 1. Intento por Digital Spot con duración 30s
+                api.subscribe_strike_list(v, 30)
+                time.sleep(0.3)
+                ok, id_op = api.buy_digital_spot(v, TRADE_AMOUNT, dir_iq, 30)
+                if ok and id_op:
+                    api.unsubscribe_strike_list(v, 30)
+                    return True, f"Blitz 30s #{id_op}"
+            except Exception:
+                pass
 
-        # Fallback a binaria turbo 1m si Digital Spot no está abierto
-        try:
-            ok, id_op = api.buy(TRADE_AMOUNT, par_limpio, dir_iq, 1)
-            if ok and id_op:
-                return True, f"Binaria Turbo Fallback #{id_op}"
-            return False, str(id_op)
-        except Exception as err:
-            return False, str(err)
+        # 2. Si no entra por digital spot, disparo directo en binaria turbo
+        for v in variantes:
+            try:
+                ok, id_op = api.buy(TRADE_AMOUNT, v, dir_iq, 1)
+                if ok and id_op:
+                    return True, f"Binaria Turbo Fallback #{id_op}"
+            except Exception:
+                pass
+        
+        return False, "Activo Blitz no disponible temporalmente en Digital Spot"
 
     # MODO BINARIAS 60S (Forex OTC tradicional)
     else:
@@ -119,7 +122,7 @@ def _ejecutar_en_broker(par, dir_iq, duracion):
             return False, str(id_op)
         except Exception as err:
             return False, str(err)
-
+            
 async def disparar_orden_segura(par, direccion, duracion):
     dir_iq = direccion.lower()
     try:
