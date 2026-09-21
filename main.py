@@ -16,7 +16,7 @@ from telegram.ext import (
     filters,
 )
 
-# ================= 1. CONFIGURACIÓN Y ENTORNO =================
+# ================= 1. CONFIGURACIÓN =================
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 IQ_USER = os.getenv("IQ_USER")
@@ -29,13 +29,13 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-# ================= 2. SERVIDOR KEEPALIVE HTTP (RENDER) =================
+# ================= 2. SERVIDOR KEEPALIVE (RENDER) =================
 class KeepAliveHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Atleon Stealth Executor Live")
+        self.wfile.write(b"Atleon Stealth Executor Activo")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -46,13 +46,13 @@ def run_web():
     server = HTTPServer(("0.0.0.0", port), KeepAliveHandler)
     server.serve_forever()
 
-# ================= 3. CONEXIÓN PERSISTENTE IQ OPTION =================
+# ================= 3. CONEXIÓN PERSISTENTE IQ =================
 api = None
 
 def conectar_iq():
     global api
     try:
-        logging.info(f"Conectando a IQ Option con {IQ_USER}...")
+        logging.info(f"Conectando a IQ Option ({IQ_USER})...")
         cliente = IQ_Option(IQ_USER.strip(), IQ_PASS.strip())
         ok, reason = cliente.connect()
         if ok:
@@ -61,10 +61,10 @@ def conectar_iq():
             logging.info(f"✅ Conectado a IQ Option ({IQ_ACCOUNT_TYPE}) | Saldo: ${api.get_balance():.2f}")
             return True
         else:
-            logging.error(f"❌ Error al conectar a IQ: {reason}")
+            logging.error(f"❌ Error al conectar: {reason}")
             return False
     except Exception as e:
-        logging.error(f"❌ Excepción durante la conexión a IQ: {e}")
+        logging.error(f"❌ Excepción en conexión: {e}")
         return False
 
 def asegurar_sesion():
@@ -73,65 +73,41 @@ def asegurar_sesion():
         return conectar_iq()
     return True
 
-# ================= 4. MOTOR DE DISPARO BLITZ Y 60S =================
-def _ejecutar_en_broker(par, dir_iq, duracion):
+# ================= 4. MOTOR DE EJECUCIÓN DIRECTO =================
+def _ejecutar_en_broker(par, dir_iq, duracion_min):
     global api
     if not asegurar_sesion():
         return False, "Broker desconectado"
 
     par_limpio = par.upper().replace("/", "").strip()
-    
-    # Lista de nombres posibles para el índice Blitz
-    variantes = [par_limpio]
-    if "GER" in par_limpio:
-        variantes = ["GERMANY30", "GER30", "GER 30"]
-    elif "AU" in par_limpio:
-        variantes = ["AUS200", "AU200", "AU 200"]
 
-    # MODO BLITZ (30s)
-    if "30" in str(duracion):
-        for v in variantes:
-            try:
-                # 1. Intento por Digital Spot con duración 30s
-                api.subscribe_strike_list(v, 30)
-                time.sleep(0.3)
-                ok, id_op = api.buy_digital_spot(v, TRADE_AMOUNT, dir_iq, 30)
-                if ok and id_op:
-                    api.unsubscribe_strike_list(v, 30)
-                    return True, f"Blitz 30s #{id_op}"
-            except Exception:
-                pass
+    # Normalización de alias Blitz
+    if par_limpio in ["GER30", "GER 30", "GERMANY 30"]:
+        par_limpio = "GERMANY30"
+    elif par_limpio in ["AU200", "AU 200"]:
+        par_limpio = "AUS200"
 
-        # 2. Si no entra por digital spot, disparo directo en binaria turbo
-        for v in variantes:
-            try:
-                ok, id_op = api.buy(TRADE_AMOUNT, v, dir_iq, 1)
-                if ok and id_op:
-                    return True, f"Binaria Turbo Fallback #{id_op}"
-            except Exception:
-                pass
-        
-        return False, "Activo Blitz no disponible temporalmente en Digital Spot"
+    # Intento de disparo vía Turbo / Binaria directa (1 minuto estándar)
+    try:
+        ok, id_op = api.buy(TRADE_AMOUNT, par_limpio, dir_iq, duracion_min)
+        if ok and id_op:
+            return True, f"Orden #{id_op}"
+        return False, f"Rechazado por broker ({id_op})"
+    except Exception as err:
+        return False, f"Error ejecución: {err}"
 
-    # MODO BINARIAS 60S (Forex OTC tradicional)
-    else:
-        try:
-            ok, id_op = api.buy(TRADE_AMOUNT, par_limpio, dir_iq, 1)
-            if ok and id_op:
-                return True, f"Binaria 60s #{id_op}"
-            return False, str(id_op)
-        except Exception as err:
-            return False, str(err)
-            
-async def disparar_orden_segura(par, direccion, duracion):
+async def disparar_orden_segura(par, direccion, duracion_str):
     dir_iq = direccion.lower()
+    # Para 30s o 60s se asigna 1 minuto en la orden turbo
+    duracion_min = 1
+
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(_ejecutar_en_broker, par, dir_iq, duracion),
-            timeout=5.0
+            asyncio.to_thread(_ejecutar_en_broker, par, dir_iq, duracion_min),
+            timeout=4.0
         )
     except asyncio.TimeoutError:
-        return False, "Tiempo de espera agotado en broker (Timeout)"
+        return False, "Timeout: Broker no devolvió confirmación en 4s"
     except Exception as e:
         return False, str(e)
 
@@ -155,7 +131,7 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     texto = update.message.text.strip().upper()
 
-    # Identificación de dirección
+    # 1. Dirección
     direccion = None
     if any(w in texto for w in ["CALL", "SUBE", "COMPRA"]):
         direccion = "CALL"
@@ -165,27 +141,29 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not direccion:
         return
 
-    # Identificación de duración
-    duracion = "30S" if any(w in texto for w in ["30S", "30 S", "BLITZ", "30"]) else "60S"
+    # 2. Duración
+    duracion = "30S" if any(w in texto for w in ["30S", "30 S", "BLITZ", " 30"]) else "60S"
 
-    # Identificación de activo
+    # 3. Activo
     par = None
-    if "GER30" in texto or "GERMANY30" in texto or "GER 30" in texto:
+    if any(k in texto for k in ["GERMANY30", "GER30", "GER 30"]):
         par = "GERMANY30"
-    elif "AU200" in texto or "AUS200" in texto or "AU 200" in texto:
+    elif any(k in texto for k in ["AUS200", "AU200", "AU 200"]):
         par = "AUS200"
-    elif "TRUMP" in texto:
-        par = "TRUMP"
+    elif "EURUSD" in texto:
+        par = "EURUSD-OTC" if "OTC" in texto else "EURUSD"
+    elif "GBPUSD" in texto:
+        par = "GBPUSD-OTC" if "OTC" in texto else "GBPUSD"
     else:
-        match = re.search(r"\b([A-Z0-9]{3,6}(?:-OTC)?)\b", texto)
-        ignorar = ["EXEC", "CALL", "PUT", "SUBE", "BAJA", "COMPRA", "VENTA", "STATUS", "BLITZ", "30S", "60S"]
+        match = re.search(r"\b([A-Z0-9_\-]+)\b", texto)
+        ignorar = ["EXEC", "CALL", "PUT", "SUBE", "BAJA", "COMPRA", "VENTA", "STATUS", "BLITZ", "30S", "60S", "30", "60"]
         if match and match.group(1) not in ignorar:
             par = match.group(1)
 
     if not par:
         return
 
-    logging.info(f"⚡ Disparando orden: {par} {direccion} {duracion}")
+    logging.info(f"⚡ Disparando orden: {par} {direccion} ({duracion})")
     exito, info = await disparar_orden_segura(par, direccion, duracion)
 
     estado = "✅" if exito else "⚠️"
