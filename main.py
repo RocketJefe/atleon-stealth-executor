@@ -73,71 +73,63 @@ def asegurar_sesion():
         return conectar_iq()
     return True
 
-# ================= 4. MOTOR DE EJECUCIÓN DIRECTO =================
-def _ejecutar_en_broker(par_solicitado, dir_iq, es_blitz):
+# ================= 4. MOTOR DE EJECUCIÓN MULTI-MODAL =================
+def _ejecutar_en_broker(par_solicitado, dir_iq):
     global api
     if not asegurar_sesion():
         return False, "Broker desconectado"
 
     par = par_solicitado.upper().replace("/", "").replace(" ", "").strip()
 
-    # MODO 1: BLITZ (30s) PARA ÍNDICES Y TOKENS BLITZ
-    if es_blitz or any(k in par for k in ["GER", "AU", "TRUMP", "BLITZ"]):
-        activo_blitz = "GERMANY30" if "GER" in par else ("AUS200" if "AU" in par else par)
-        
-        # Intento vía buy_digital_spot para Blitz
-        try:
-            api.subscribe_strike_list(activo_blitz, 30)
-            time.sleep(0.3)
-            ok, id_op = api.buy_digital_spot(activo_blitz, TRADE_AMOUNT, dir_iq, 30)
-            if ok and id_op:
-                api.unsubscribe_strike_list(activo_blitz, 30)
-                return True, f"Blitz 30s #{id_op} en `{activo_blitz}`"
-        except Exception as e:
-            logging.warning(f"Error digital spot: {e}")
+    # Mapeo de índices
+    if any(k in par for k in ["GER", "GERMANY"]):
+        par = "GERMANY30"
+    elif any(k in par for k in ["AU200", "AUS200"]):
+        par = "AUS200"
 
-        # Intento vía buy_digital_spot_v2
-        try:
-            ok, id_op = api.buy_digital_spot_v2(activo_blitz, TRADE_AMOUNT, dir_iq, 30)
-            if ok and id_op:
-                return True, f"Blitz SpotV2 #{id_op} en `{activo_blitz}`"
-        except Exception:
-            pass
-
-        return False, f"Blitz no disponible en `{activo_blitz}`"
-
-    # MODO 2: BINARIAS 60S (FOREX / OTC)
-    # Lista de variantes para asegurar compatibilidad
-    variantes = [par]
+    # Generación de variantes de búsqueda
+    candidatos = [par]
     if "-OTC" in par:
-        variantes.append(par.replace("-OTC", ""))
+        candidatos.append(par.replace("-OTC", ""))
     else:
-        variantes.append(f"{par}-OTC")
+        candidatos.append(f"{par}-OTC")
 
-    ultimo_err = "No disponible"
-    for p in variantes:
+    ultimo_error = "No disponible"
+
+    # 1. RUTA: Binaria Turbo (1 minuto estándar)
+    for p in candidatos:
         try:
             ok, id_op = api.buy(TRADE_AMOUNT, p, dir_iq, 1)
-            if ok and isinstance(id_op, int):
-                return True, f"Orden #{id_op} en `{p}`"
-            elif ok and id_op:
-                return True, f"Orden #{id_op} en `{p}`"
+            if ok and (isinstance(id_op, int) or id_op):
+                return True, f"Binaria #{id_op} en `{p}`"
             else:
-                ultimo_err = str(id_op)
+                ultimo_error = str(id_op)
         except Exception as e:
-            ultimo_err = str(e)
+            ultimo_error = str(e)
 
-    return False, f"Rechazado ({ultimo_err})"
+    # 2. RUTA FALLBACK: Digital Spot (1 minuto) si Binarias está temporalmente cerrado
+    for p in candidatos:
+        try:
+            api.subscribe_strike_list(p, 1)
+            time.sleep(0.3)
+            ok, id_op = api.buy_digital_spot(p, TRADE_AMOUNT, dir_iq, 1)
+            if ok and id_op:
+                api.unsubscribe_strike_list(p, 1)
+                return True, f"Digital #{id_op} en `{p}`"
+        except Exception as e:
+            ultimo_error = str(e)
 
-async def disparar_orden_segura(par, direccion, es_blitz):
+    return False, f"Rechazado ({ultimo_error})"
+
+async def disparar_orden_segura(par, direccion):
     dir_iq = direccion.lower()
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(_ejecutar_en_broker, par, dir_iq, es_blitz),
-            timeout=4.0
+            asyncio.to_thread(_ejecutar_en_broker, par, dir_iq),
+            timeout=4.5
         )
     except asyncio.TimeoutError:
-        return False, "Timeout en broker (4s)"
+        return False, "Timeout en broker (4.5s)"
     except Exception as e:
         return False, str(e)
 
@@ -155,34 +147,6 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Sin conexión con IQ Option.")
 
-async def abiertos_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not asegurar_sesion():
-        await update.message.reply_text("❌ Broker desconectado.")
-        return
-
-    msg = await update.message.reply_text("⚡ Verificando cotizaciones...")
-    candidatos = [
-        "EURUSD", "EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC",
-        "AUDCAD-OTC", "GERMANY30", "AUS200"
-    ]
-    activos = []
-    ahora = time.time()
-
-    for p in candidatos:
-        try:
-            candles = api.get_candles(p, 60, 1, ahora)
-            if candles and len(candles) > 0 and "close" in candles[0]:
-                activos.append(p)
-        except Exception:
-            continue
-
-    if activos:
-        texto = "🟢 **Activos Disponibles en este momento:**\n\n" + ", ".join([f"`{a}`" for a in activos])
-    else:
-        texto = "⚠️ Esperando sincronización de cotizaciones."
-
-    await msg.edit_text(texto, parse_mode=constants.ParseMode.MARKDOWN)
-
 async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -199,11 +163,7 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not direccion:
         return
 
-    # 2. Detección Blitz
-    es_blitz = any(w in texto for w in ["30S", "30 S", "BLITZ", "GER", "AU200", "AUS200"])
-    dur_label = "30S (Blitz)" if es_blitz else "60S (Binaria)"
-
-    # 3. Extracción limpia de par
+    # 2. Extracción de Par
     par = None
     if any(k in texto for k in ["GER30", "GERMANY", "GER 30"]):
         par = "GERMANY30"
@@ -213,12 +173,9 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
         par = "EURUSD-OTC" if "OTC" in texto else "EURUSD"
     elif "GBPUSD" in texto:
         par = "GBPUSD-OTC" if "OTC" in texto else "GBPUSD"
-    elif "AUDCAD" in texto:
-        par = "AUDCAD-OTC" if "OTC" in texto else "AUDCAD"
     else:
-        # Extraer tokens alfanuméricos incluyendo guiones
         tokens = re.findall(r"[A-Z0-9\-]+", texto)
-        ignorar = ["EXEC", "CALL", "PUT", "SUBE", "BAJA", "COMPRA", "VENTA", "STATUS", "BLITZ", "30S", "60S", "30", "60", "ACTIVO"]
+        ignorar = ["EXEC", "CALL", "PUT", "SUBE", "BAJA", "COMPRA", "VENTA", "STATUS", "BLITZ", "30S", "60S", "30", "60"]
         for t in tokens:
             if t not in ignorar and len(t) >= 3:
                 par = t
@@ -227,12 +184,12 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not par:
         return
 
-    logging.info(f"⚡ Ejecutando: {par} {direccion} | {dur_label}")
-    exito, info = await disparar_orden_segura(par, direccion, es_blitz)
+    logging.info(f"⚡ Ejecutando: {par} {direccion}")
+    exito, info = await disparar_orden_segura(par, direccion)
 
     estado = "✅" if exito else "⚠️"
     await update.message.reply_text(
-        f"{estado} `{par}` {direccion} ({dur_label}) ➔ {info}",
+        f"{estado} `{par}` {direccion} ➔ {info}",
         parse_mode=constants.ParseMode.MARKDOWN
     )
 
@@ -243,7 +200,6 @@ if __name__ == "__main__":
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("abiertos", abiertos_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_mensaje))
 
     app.run_polling(drop_pending_updates=True)
