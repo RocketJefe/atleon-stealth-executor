@@ -1,5 +1,5 @@
 flask
 requests
-iqoptionapi
+git+https://github.com/Lu-Yi-Hsun/iqoptionapi.git
 websocket-client==0.57.0
 python-dotenv
