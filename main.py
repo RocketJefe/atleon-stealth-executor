@@ -29,13 +29,13 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-# ================= 2. SERVIDOR KEEPALIVE HTTP (RENDER) =================
+# ================= 2. KEEPALIVE HTTP (RENDER) =================
 class KeepAliveHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Atleon Stealth Executor Activo")
+        self.wfile.write(b"Atleon Stealth Blitz Executor Live")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -46,25 +46,25 @@ def run_web():
     server = HTTPServer(("0.0.0.0", port), KeepAliveHandler)
     server.serve_forever()
 
-# ================= 3. CONEXIÓN PERSISTENTE IQ =================
+# ================= 3. CONEXIÓN PERSISTENTE A IQ OPTION =================
 api = None
 
 def conectar_iq():
     global api
     try:
-        logging.info(f"Conectando a IQ Option ({IQ_USER})...")
+        logging.info(f"⚡ Conectando motor Blitz a IQ Option ({IQ_USER})...")
         cliente = IQ_Option(IQ_USER.strip(), IQ_PASS.strip())
         ok, reason = cliente.connect()
         if ok:
             cliente.change_balance(IQ_ACCOUNT_TYPE)
             api = cliente
-            logging.info(f"✅ Conectado a IQ Option ({IQ_ACCOUNT_TYPE}) | Saldo: ${api.get_balance():.2f}")
+            logging.info(f"⚡ [BLITZ ENGINE LISTO] Cuenta: {IQ_ACCOUNT_TYPE} | Saldo: ${api.get_balance():.2f}")
             return True
         else:
-            logging.error(f"❌ Error al conectar: {reason}")
+            logging.error(f"❌ Error al conectar a IQ: {reason}")
             return False
     except Exception as e:
-        logging.error(f"❌ Excepción en conexión: {e}")
+        logging.error(f"❌ Excepción durante la conexión: {e}")
         return False
 
 def asegurar_sesion():
@@ -73,63 +73,58 @@ def asegurar_sesion():
         return conectar_iq()
     return True
 
-# ================= 4. MOTOR DE EJECUCIÓN MULTI-MODAL =================
-def _ejecutar_en_broker(par_solicitado, dir_iq):
+# ================= 4. MOTOR EXCLUSIVO BLITZ 30S =================
+def _disparar_blitz_en_broker(activo, dir_iq):
     global api
     if not asegurar_sesion():
         return False, "Broker desconectado"
 
-    par = par_solicitado.upper().replace("/", "").replace(" ", "").strip()
+    # 1. Normalización estricta de nombres Blitz de IQ Option
+    activo_normalizado = activo.upper().replace("/", "").replace(" ", "").strip()
+    if any(k in activo_normalizado for k in ["GER", "GERMANY"]):
+        activo_normalizado = "GERMANY30"
+    elif any(k in activo_normalizado for k in ["AU", "AUS"]):
+        activo_normalizado = "AUS200"
+    elif "TRUMP" in activo_normalizado:
+        activo_normalizado = "TRUMP"
 
-    # Mapeo de índices
-    if any(k in par for k in ["GER", "GERMANY"]):
-        par = "GERMANY30"
-    elif any(k in par for k in ["AU200", "AUS200"]):
-        par = "AUS200"
+    # 2. Suscribir stream de strikes y asegurar sincronización en WebSocket
+    try:
+        api.subscribe_strike_list(activo_normalizado, 30)
+    except Exception as e:
+        logging.warning(f"Error en subscribe_strike_list: {e}")
 
-    # Generación de variantes de búsqueda
-    candidatos = [par]
-    if "-OTC" in par:
-        candidatos.append(par.replace("-OTC", ""))
-    else:
-        candidatos.append(f"{par}-OTC")
+    # Breve espera de sincronización de ticks en memoria
+    time.sleep(0.5)
 
-    ultimo_error = "No disponible"
+    # 3. Disparo Digital Spot / Blitz
+    try:
+        # Intento con duración 30 segundos
+        ok, id_op = api.buy_digital_spot(activo_normalizado, TRADE_AMOUNT, dir_iq, 30)
+        if ok and id_op:
+            return True, f"Blitz 30s #{id_op}"
+    except Exception as e:
+        logging.error(f"Error buy_digital_spot: {e}")
 
-    # 1. RUTA: Binaria Turbo (1 minuto estándar)
-    for p in candidatos:
-        try:
-            ok, id_op = api.buy(TRADE_AMOUNT, p, dir_iq, 1)
-            if ok and (isinstance(id_op, int) or id_op):
-                return True, f"Binaria #{id_op} en `{p}`"
-            else:
-                ultimo_error = str(id_op)
-        except Exception as e:
-            ultimo_error = str(e)
+    # Intento con endpoint v2 de digital spot para Blitz
+    try:
+        ok, id_op = api.buy_digital_spot_v2(activo_normalizado, TRADE_AMOUNT, dir_iq, 30)
+        if ok and id_op:
+            return True, f"Blitz SpotV2 #{id_op}"
+    except Exception as e:
+        logging.error(f"Error buy_digital_spot_v2: {e}")
 
-    # 2. RUTA FALLBACK: Digital Spot (1 minuto) si Binarias está temporalmente cerrado
-    for p in candidatos:
-        try:
-            api.subscribe_strike_list(p, 1)
-            time.sleep(0.3)
-            ok, id_op = api.buy_digital_spot(p, TRADE_AMOUNT, dir_iq, 1)
-            if ok and id_op:
-                api.unsubscribe_strike_list(p, 1)
-                return True, f"Digital #{id_op} en `{p}`"
-        except Exception as e:
-            ultimo_error = str(e)
+    return False, f"Activo Blitz `{activo_normalizado}` no devolvió ID"
 
-    return False, f"Rechazado ({ultimo_error})"
-
-async def disparar_orden_segura(par, direccion):
+async def ejecutar_blitz_seguro(activo, direccion):
     dir_iq = direccion.lower()
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(_ejecutar_en_broker, par, dir_iq),
+            asyncio.to_thread(_disparar_blitz_en_broker, activo, dir_iq),
             timeout=4.5
         )
     except asyncio.TimeoutError:
-        return False, "Timeout en broker (4.5s)"
+        return False, "Timeout: IQ Option no confirmó el strike Blitz en 4.5s"
     except Exception as e:
         return False, str(e)
 
@@ -138,58 +133,84 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if asegurar_sesion():
         saldo = api.get_balance()
         await update.message.reply_text(
-            f"👻 **Atleon Stealth Executor**\n"
-            f"• Estado: 🟢 Operativo\n"
+            f"⚡ **Atleon Stealth Blitz Executor**\n"
+            f"• Estado: 🟢 Operativo (Modo Blitz 30s)\n"
             f"• Saldo: `${saldo:.2f}`\n"
-            f"• Cuenta: `{IQ_ACCOUNT_TYPE}`",
+            f"• Cuenta: `{IQ_ACCOUNT_TYPE}`\n"
+            f"• Monto por Trade: `${TRADE_AMOUNT:.2f}`",
             parse_mode=constants.ParseMode.MARKDOWN
         )
     else:
         await update.message.reply_text("❌ Sin conexión con IQ Option.")
 
-async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def blitz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not asegurar_sesion():
+        await update.message.reply_text("❌ Broker desconectado.")
+        return
+
+    msg = await update.message.reply_text("🔍 Escaneando activos Blitz disponibles...")
+    candidatos_blitz = ["GERMANY30", "AUS200", "US30", "TRUMP"]
+    activos_ok = []
+    ahora = time.time()
+
+    for act in candidatos_blitz:
+        try:
+            candles = api.get_candles(act, 60, 1, ahora)
+            if candles and len(candles) > 0:
+                activos_ok.append(act)
+        except Exception:
+            continue
+
+    if activos_ok:
+        texto = "⚡ **Activos Blitz con Cotización Activa:**\n\n" + ", ".join([f"`{a}`" for a in activos_ok])
+    else:
+        texto = "⚠️ No se detectaron cotizaciones Blitz activas en este instante."
+
+    await msg.edit_text(texto, parse_mode=constants.ParseMode.MARKDOWN)
+
+async def procesar_orden_blitz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
     texto = update.message.text.strip().upper()
 
-    # 1. Dirección
+    # 1. Dirección obligatoria
     direccion = None
-    if any(w in texto for w in ["CALL", "SUBE", "COMPRA"]):
+    if any(w in texto for w in ["CALL", "SUBE", "COMPRA", "HIGHER"]):
         direccion = "CALL"
-    elif any(w in texto for w in ["PUT", "BAJA", "VENTA"]):
+    elif any(w in texto for w in ["PUT", "BAJA", "VENTA", "LOWER"]):
         direccion = "PUT"
 
     if not direccion:
         return
 
-    # 2. Extracción de Par
-    par = None
-    if any(k in texto for k in ["GER30", "GERMANY", "GER 30"]):
-        par = "GERMANY30"
-    elif any(k in texto for k in ["AUS200", "AU200", "AU 200"]):
-        par = "AUS200"
-    elif "EURUSD" in texto:
-        par = "EURUSD-OTC" if "OTC" in texto else "EURUSD"
-    elif "GBPUSD" in texto:
-        par = "GBPUSD-OTC" if "OTC" in texto else "GBPUSD"
+    # 2. Identificar el activo Blitz
+    activo = None
+    if any(k in texto for k in ["GER30", "GERMANY", "GER 30", "DE30"]):
+        activo = "GERMANY30"
+    elif any(k in texto for k in ["AUS200", "AU200", "AU 200", "AUS 200"]):
+        activo = "AUS200"
+    elif "TRUMP" in texto:
+        activo = "TRUMP"
+    elif "US30" in texto:
+        activo = "US30"
     else:
-        tokens = re.findall(r"[A-Z0-9\-]+", texto)
+        tokens = re.findall(r"[A-Z0-9]+", texto)
         ignorar = ["EXEC", "CALL", "PUT", "SUBE", "BAJA", "COMPRA", "VENTA", "STATUS", "BLITZ", "30S", "60S", "30", "60"]
         for t in tokens:
             if t not in ignorar and len(t) >= 3:
-                par = t
+                activo = t
                 break
 
-    if not par:
+    if not activo:
         return
 
-    logging.info(f"⚡ Ejecutando: {par} {direccion}")
-    exito, info = await disparar_orden_segura(par, direccion)
+    logging.info(f"⚡ [DISPARO BLITZ]: {activo} {direccion} (30s)")
+    exito, info = await ejecutar_blitz_seguro(activo, direccion)
 
     estado = "✅" if exito else "⚠️"
     await update.message.reply_text(
-        f"{estado} `{par}` {direccion} ➔ {info}",
+        f"{estado} ⚡ **BLITZ 30S** | `{activo}` {direccion} ➔ {info}",
         parse_mode=constants.ParseMode.MARKDOWN
     )
 
@@ -200,6 +221,7 @@ if __name__ == "__main__":
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_mensaje))
+    app.add_handler(CommandHandler("blitz", blitz_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_orden_blitz))
 
     app.run_polling(drop_pending_updates=True)
