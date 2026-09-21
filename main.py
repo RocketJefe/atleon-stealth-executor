@@ -46,7 +46,7 @@ def run_web():
     server = HTTPServer(("0.0.0.0", port), KeepAliveHandler)
     server.serve_forever()
 
-# ================= 3. CONEXIÓN PERSISTENTE IQ OPTION =================
+# ================= 3. CONEXIÓN A IQ OPTION =================
 api = None
 
 def conectar_iq():
@@ -102,33 +102,34 @@ def _disparar_blitz_nativo(activo_raw, dir_iq):
     active_id = target["id"]
     display_name = target["name"]
     dir_str = "call" if "call" in dir_iq.lower() or "sube" in dir_iq.lower() else "put"
+    server_time = int(api.get_server_timestamp())
+    exp_time = server_time + 30
 
-    # Intento 1: Llamada al WebSocket subyacente mediante open_option
+    # Intento 1: Función nativa buy_by_raw_expirations (con la s al final)
     try:
-        if hasattr(api.api, "open_option"):
-            # Expiración a 30 segundos
-            exp_time = int(api.get_server_timestamp()) + 30
-            api.api.open_option(active_id, TRADE_AMOUNT, dir_str, 3, exp_time)
-            time.sleep(0.35)
-            return True, f"Blitz disparado en `{display_name}` (ID `{active_id}`)"
+        ok, id_op = api.buy_by_raw_expirations(TRADE_AMOUNT, active_id, dir_str, exp_time)
+        if ok and id_op:
+            return True, f"Blitz #{id_op} en `{display_name}`"
     except Exception as e:
-        logging.warning(f"Fallo open_option: {e}")
+        logging.warning(f"Fallo buy_by_raw_expirations: {e}")
 
-    # Intento 2: Inyección mediante buy_by_raw_expired con nombre de método exacto
+    # Intento 2: Inyección por buyv3 del WebSocket (motor turbo nativo)
     try:
-        if hasattr(api, "buy_by_raw_expired"):
-            exp_time = int(api.get_server_timestamp()) + 30
-            api.buy_by_raw_expired(TRADE_AMOUNT, active_id, dir_str, exp_time)
-            return True, f"Blitz orden colocada en `{display_name}`"
+        ok, id_op = api.api.buyv3(TRADE_AMOUNT, active_id, dir_str, 1)
+        if ok and id_op:
+            return True, f"Blitz V3 #{id_op} en `{display_name}`"
     except Exception as e:
-        logging.warning(f"Fallo buy_by_raw_expired: {e}")
+        logging.warning(f"Fallo buyv3: {e}")
 
-    # Intento 3: Disparo por buy_order de la API interna
+    # Intento 3: Disparo por open_binary_option
     try:
-        api.api.buy_order(active_id, TRADE_AMOUNT, dir_str, 1)
-        return True, f"Blitz buy_order enviado a `{display_name}`"
+        ok, id_op = api.api.open_binary_option(active_id, TRADE_AMOUNT, dir_str, exp_time)
+        if ok and id_op:
+            return True, f"Blitz Bin #{id_op} en `{display_name}`"
     except Exception as e:
         return False, f"Rechazado en broker: {e}"
+
+    return False, f"Sin confirmación en `{display_name}`"
 
 async def ejecutar_blitz_seguro(activo, direccion):
     try:
@@ -137,7 +138,7 @@ async def ejecutar_blitz_seguro(activo, direccion):
             timeout=3.5
         )
     except asyncio.TimeoutError:
-        return False, "Timeout en conexión"
+        return False, "Timeout: Petición enviada al broker"
     except Exception as e:
         return False, str(e)
 
