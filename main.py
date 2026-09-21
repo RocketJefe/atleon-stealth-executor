@@ -1,5 +1,6 @@
 import os
 import time
+import re
 import requests
 import threading
 from flask import Flask
@@ -33,7 +34,6 @@ def conectar():
     global api
     with lock:
         try:
-            print(f"[IQ] Conectando a {IQ_USER}...")
             cliente = IQ_Option(IQ_USER, IQ_PASS)
             ok, motivo = cliente.connect()
             if ok:
@@ -57,36 +57,44 @@ def disparar(par, direccion, duracion):
         return False, "Broker no disponible"
 
     dir_iq = direccion.lower()
+    par_limpio = par.upper().replace("/", "").strip()
 
-    # Modalidad Blitz 30s
-    if "30" in duracion:
+    # Normalización para índices Blitz
+    if par_limpio in ["GER30", "GER 30", "GERMANY30"]:
+        par_limpio = "GERMANY30"
+    elif par_limpio in ["AU200", "AU 200", "AUS200"]:
+        par_limpio = "AUS200"
+
+    # 1. Modalidad Blitz 30s
+    if "30" in str(duracion):
+        # Intento vía Digital Spot (30s)
         try:
-            ok, id_op = api.buy_digital_spot(par, TRADE_AMOUNT, dir_iq, 30)
+            ok, id_op = api.buy_digital_spot(par_limpio, TRADE_AMOUNT, dir_iq, 30)
             if ok and id_op:
                 return True, f"Blitz 30s #{id_op}"
         except Exception as e:
             print(f"[DIGITAL ERR]: {e}")
 
-        # Fallback a Binarias si el activo no responde por Digital Spot
+        # Fallback a Binarias 1m si Digital Spot no está abierto
         try:
-            ok, id_op = api.buy(TRADE_AMOUNT, par, dir_iq, 1)
+            ok, id_op = api.buy(TRADE_AMOUNT, par_limpio, dir_iq, 1)
             if ok and id_op:
                 return True, f"Binaria Fallback #{id_op}"
             return False, str(id_op)
         except Exception as err:
             return False, str(err)
 
-    # Modalidad Binarias 60s (Forex / OTC)
+    # 2. Modalidad Binarias 60s (Forex / OTC)
     else:
         try:
-            ok, id_op = api.buy(TRADE_AMOUNT, par, dir_iq, 1)
+            ok, id_op = api.buy(TRADE_AMOUNT, par_limpio, dir_iq, 1)
             if ok and id_op:
                 return True, f"Binaria 60s #{id_op}"
             return False, str(id_op)
         except Exception as err:
             return False, str(err)
 
-# ================= ESCUCHA SILENCIOSA =================
+# ================= ESCUCHA SILENCIOSA CON REGEX =================
 def listener():
     try:
         requests.get(f"{TG_API}/deleteWebhook?drop_pending_updates=True", timeout=5)
@@ -94,7 +102,7 @@ def listener():
         pass
 
     last_id = 0
-    print("👂 Escuchando señales clandestinas...")
+    print("👂 Escuchando señales en segundo plano...")
 
     while True:
         try:
@@ -114,6 +122,7 @@ def listener():
 
                 # Estado
                 if texto.upper() == "/STATUS":
+                    asegurar_sesion()
                     saldo = f"${api.get_balance():.2f}" if (api and api.check_connect()) else "Desconectado"
                     requests.post(f"{TG_API}/sendMessage", json={
                         "chat_id": chat_id,
@@ -121,22 +130,23 @@ def listener():
                     }, timeout=5)
                     continue
 
-                # Disparo en seco (Ej: ⚡ EXEC GERMANY30 CALL 30S o ⚡ EXEC GBPUSD-OTC PUT 60S)
-                if "EXEC" in texto:
-                    partes = texto.split()
-                    if len(partes) >= 5:
-                        par = partes[2]
-                        direccion = partes[3]
-                        duracion = partes[4]
+                # Detección flexible mediante Expresión Regular
+                # Captura cualquier mensaje que contenga EXEC seguido del par, CALL/PUT y duración opcional
+                match = re.search(r"EXEC\s+([A-Z0-9_\-]+)\s+(CALL|PUT|SUBE|BAJA)(?:\s+(\d+\s*[SM]?))?", texto, re.IGNORECASE)
+                if match:
+                    par = match.group(1).strip().upper()
+                    dir_raw = match.group(2).strip().upper()
+                    direccion = "call" if dir_raw in ["CALL", "SUBE"] else "put"
+                    duracion = match.group(3) if match.group(3) else "60S"
 
-                        print(f"⚡ [ORDEN DETECTADA] {par} | {direccion} | {duracion}")
-                        exito, info = disparar(par, direccion, duracion)
+                    print(f"⚡ [ORDEN DETECTADA] {par} | {direccion} | {duracion}")
+                    exito, info = disparar(par, direccion, duracion)
 
-                        estado = "✅" if exito else "⚠️"
-                        requests.post(f"{TG_API}/sendMessage", json={
-                            "chat_id": chat_id,
-                            "text": f"{estado} `{par}` {direccion} ({duracion}) -> {info}"
-                        }, timeout=3)
+                    estado = "✅" if exito else "⚠️"
+                    requests.post(f"{TG_API}/sendMessage", json={
+                        "chat_id": chat_id,
+                        "text": f"{estado} `{par}` {direccion.upper()} ({duracion}) -> {info}"
+                    }, timeout=5)
 
         except Exception as e:
             print(f"[LOOP EXCEPTION]: {e}")
