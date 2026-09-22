@@ -49,22 +49,31 @@ def run_web():
 # ================= 3. CONEXIÓN A IQ OPTION =================
 api = None
 
+# IDs comprobados en el broker para Blitz
+BLITZ_MAP = {
+    "GER": 2046,
+    "GER30": 2046,
+    "GERMANY": 2046,
+    "GER30-OTC": 2046,
+    "AU": 2048,
+    "AU200": 2048,
+    "AUS200": 2048,
+    "AUS200-OTC": 2048,
+    "TRUMP": 2265,
+    "TRUMPUSD": 2265,
+    "TRUMPUSD-OTC": 2265,
+}
+
 def registrar_ids_blitz():
-    """Inyecta los IDs de activos Blitz directamente en el diccionario interno del broker"""
+    """Registra los IDs en el diccionario de bajo nivel api.api.ACTIVES_OPCODE"""
     global api
-    if api:
-        mapeo = {
-            "GER30-OTC": 2046,
-            "GER 30": 2046,
-            "GERMANY30": 2046,
-            "AUS200-OTC": 2048,
-            "AU 200": 2048,
-            "TRUMPUSD-OTC": 2265,
-            "TRUMP": 2265,
-        }
-        for nombre, aid in mapeo.items():
-            api.ACTIVES_OPCODE[nombre] = aid
-        logging.info("⚡ [BLITZ] IDs numéricos mapeados en memoria con éxito.")
+    if api and hasattr(api, "api") and hasattr(api.api, "ACTIVES_OPCODE"):
+        try:
+            for nom, aid in BLITZ_MAP.items():
+                api.api.ACTIVES_OPCODE[nom] = aid
+            logging.info("⚡ [BLITZ] IDs mapeados en api.api.ACTIVES_OPCODE.")
+        except Exception as e:
+            logging.warning(f"No se pudo mapear ACTIVES_OPCODE: {e}")
 
 def conectar_iq():
     global api
@@ -76,13 +85,13 @@ def conectar_iq():
             cliente.change_balance(IQ_ACCOUNT_TYPE)
             api = cliente
             registrar_ids_blitz()
-            logging.info(f"⚡ [BLITZ ENGINE LISTO] Saldo: ${api.get_balance():.2f}")
+            logging.info(f"⚡ [BLITZ LISTO] Cuenta: {IQ_ACCOUNT_TYPE} | Saldo: ${api.get_balance():.2f}")
             return True
         else:
             logging.error(f"❌ Error al conectar a IQ: {reason}")
             return False
     except Exception as e:
-        logging.error(f"❌ Excepción: {e}")
+        logging.error(f"❌ Excepción en conexión: {e}")
         return False
 
 def asegurar_sesion():
@@ -91,36 +100,54 @@ def asegurar_sesion():
         return conectar_iq()
     return True
 
-# ================= 4. MOTOR DE EJECUCIÓN DIRECTO =================
+# ================= 4. MOTOR DE EJECUCIÓN BLITZ =================
 def _disparar_blitz_nativo(activo_raw, dir_iq):
     global api
     if not asegurar_sesion():
         return False, "Broker desconectado"
 
-    raw = activo_raw.upper().replace("/", "").strip()
+    raw = activo_raw.upper().replace("/", "").replace(" ", "").strip()
     dir_str = "call" if "call" in dir_iq.lower() or "sube" in dir_iq.lower() else "put"
 
-    # Seleccionar activo registrado
-    if any(k in raw for k in ["GER", "GERMANY"]):
-        par_activo = "GER30-OTC"
-    elif any(k in raw for k in ["AU", "AUS"]):
-        par_activo = "AUS200-OTC"
-    elif "TRUMP" in raw:
-        par_activo = "TRUMPUSD-OTC"
-    else:
-        par_activo = raw
+    # Determinar el ID del activo Blitz
+    active_id = BLITZ_MAP.get(raw)
+    if not active_id:
+        if any(k in raw for k in ["GER", "GERMANY"]):
+            active_id = 2046
+        elif any(k in raw for k in ["AU", "AUS"]):
+            active_id = 2048
+        elif "TRUMP" in raw:
+            active_id = 2265
+        else:
+            active_id = 2046  # Fallback a GER 30
 
-    # Asegurar mapeo en memoria antes de comprar
     registrar_ids_blitz()
+    ultimo_err = "Sin respuesta"
 
-    # Disparo directo mediante api.buy nativo con el ID inyectado
+    # Intento 1: Disparo directo por buyv3 pasando el active_id numérico
     try:
-        ok, id_op = api.buy(TRADE_AMOUNT, par_activo, dir_str, 1)
-        if ok and (isinstance(id_op, int) or id_op):
-            return True, f"Blitz #{id_op} en `{par_activo}`"
-        return False, f"Rechazado por broker ({id_op})"
+        if hasattr(api, "api") and hasattr(api.api, "buyv3"):
+            ok, id_op = api.api.buyv3(TRADE_AMOUNT, active_id, dir_str, 1)
+            if ok and (isinstance(id_op, int) or id_op):
+                return True, f"Blitz #{id_op} en ID `{active_id}`"
+            else:
+                ultimo_err = str(id_op)
     except Exception as e:
-        return False, f"Error ejecución: {e}"
+        ultimo_err = str(e)
+
+    # Intento 2: Inyección por api.buy convencional usando el par registrado
+    nombres_probar = [k for k, v in BLITZ_MAP.items() if v == active_id]
+    for n in nombres_probar:
+        try:
+            ok, id_op = api.buy(TRADE_AMOUNT, n, dir_str, 1)
+            if ok and (isinstance(id_op, int) or id_op):
+                return True, f"Blitz #{id_op} en `{n}`"
+            else:
+                ultimo_err = str(id_op)
+        except Exception as e:
+            ultimo_err = str(e)
+
+    return False, f"Rechazado ({ultimo_err})"
 
 async def ejecutar_blitz_seguro(activo, direccion):
     try:
@@ -164,7 +191,7 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not direccion:
         return
 
-    # 2. Identificar activo
+    # 2. Identificar activo Blitz
     activo = "GER 30"
     if any(k in texto for k in ["GER30", "GERMANY", "GER 30", "GER"]):
         activo = "GER 30"
