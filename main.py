@@ -1,9 +1,9 @@
 import os
 import re
 import time
+import json
 import logging
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
@@ -30,10 +30,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-# Pool dedicado para llamadas bloqueantes al broker
-thread_pool = ThreadPoolExecutor(max_workers=4)
-
-# ================= 2. SERVIDOR KEEPALIVE HTTP =================
+# ================= 2. SERVIDOR KEEPALIVE HTTP (RENDER) =================
 class KeepAliveHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -50,30 +47,18 @@ def run_web():
     server = HTTPServer(("0.0.0.0", port), KeepAliveHandler)
     server.serve_forever()
 
-# ================= 3. CONEXIÓN PERSISTENTE A IQ OPTION =================
+# ================= 3. CONEXIÓN A IQ OPTION =================
 api = None
 
-# Mapeo exacto comprobado en el backend de IQ Option
-BLITZ_MAP = {
-    "GER": {"name": "GER30-OTC", "id": 2046, "label": "GER 30 Blitz"},
-    "GER30": {"name": "GER30-OTC", "id": 2046, "label": "GER 30 Blitz"},
-    "GERMANY": {"name": "GER30-OTC", "id": 2046, "label": "GER 30 Blitz"},
-    "AU": {"name": "AUS200-OTC", "id": 2048, "label": "AU 200 Blitz"},
-    "AU200": {"name": "AUS200-OTC", "id": 2048, "label": "AU 200 Blitz"},
-    "AUS200": {"name": "AUS200-OTC", "id": 2048, "label": "AU 200 Blitz"},
-    "TRUMP": {"name": "TRUMPUSD-OTC", "id": 2265, "label": "TRUMP Coin Blitz"},
+BLITZ_DATA = {
+    "GER": {"id": 2046, "name": "GER 30 Blitz", "code": "GER30-OTC", "digital": "GER30"},
+    "GER30": {"id": 2046, "name": "GER 30 Blitz", "code": "GER30-OTC", "digital": "GER30"},
+    "GERMANY": {"id": 2046, "name": "GER 30 Blitz", "code": "GER30-OTC", "digital": "GER30"},
+    "AU": {"id": 2048, "name": "AU 200 Blitz", "code": "AUS200-OTC", "digital": "AUS200"},
+    "AU200": {"id": 2048, "name": "AU 200 Blitz", "code": "AUS200-OTC", "digital": "AUS200"},
+    "AUS200": {"id": 2048, "name": "AU 200 Blitz", "code": "AUS200-OTC", "digital": "AUS200"},
+    "TRUMP": {"id": 2265, "name": "TRUMP Coin Blitz", "code": "TRUMPUSD-OTC", "digital": "TRUMPUSD"},
 }
-
-def registrar_ids_en_libreria():
-    """Inyecta los nombres e IDs en el diccionario interno para que las funciones nativas los reconozcan"""
-    global api
-    if api and hasattr(api, "api") and hasattr(api.api, "ACTIVES_OPCODE"):
-        try:
-            for _, data in BLITZ_MAP.items():
-                api.api.ACTIVES_OPCODE[data["name"]] = data["id"]
-                api.api.ACTIVES_OPCODE[data["label"]] = data["id"]
-        except Exception as e:
-            logging.warning(f"Aviso registrando activos: {e}")
 
 def conectar_iq():
     global api
@@ -84,14 +69,18 @@ def conectar_iq():
         if ok:
             cliente.change_balance(IQ_ACCOUNT_TYPE)
             api = cliente
-            registrar_ids_en_libreria()
+            # Mapear activos en la tabla de memoria interna de la API
+            if hasattr(api, "api") and hasattr(api.api, "ACTIVES_OPCODE"):
+                for _, info in BLITZ_DATA.items():
+                    api.api.ACTIVES_OPCODE[info["code"]] = info["id"]
+                    api.api.ACTIVES_OPCODE[info["name"]] = info["id"]
             logging.info(f"⚡ [BLITZ ENGINE LISTO] Cuenta: {IQ_ACCOUNT_TYPE} | Saldo: ${api.get_balance():.2f}")
             return True
         else:
             logging.error(f"❌ Error al conectar a IQ: {reason}")
             return False
     except Exception as e:
-        logging.error(f"❌ Excepción durante conexión: {e}")
+        logging.error(f"❌ Excepción durante la conexión: {e}")
         return False
 
 def asegurar_sesion():
@@ -100,68 +89,85 @@ def asegurar_sesion():
         return conectar_iq()
     return True
 
-# ================= 4. MOTOR DE EJECUCIÓN BLITZ CON buy_by_raw_expirations =================
-def _disparar_blitz_worker(activo_raw, dir_iq):
+# ================= 4. MOTOR DE EJECUCIÓN NATIVO BLITZ =================
+def _disparar_blitz_nativo(activo_raw, dir_iq):
     global api
     if not asegurar_sesion():
         return False, "Broker desconectado"
 
     raw = activo_raw.upper().replace("/", "").strip()
+    
     target = None
-    for key, data in BLITZ_MAP.items():
+    for key, data in BLITZ_DATA.items():
         if key in raw:
             target = data
             break
 
     if not target:
-        target = BLITZ_MAP["GER"]
+        target = BLITZ_DATA["GER30"]
 
-    par_broker = target["name"]
-    etiqueta = target["label"]
+    active_id = target["id"]
+    display_name = target["name"]
+    code_otc = target["code"]
+    code_dig = target["digital"]
     dir_str = "call" if "call" in dir_iq.lower() or "sube" in dir_iq.lower() else "put"
-    
-    # Calcular expiración: tiempo actual del broker + 30 segundos
-    try:
-        server_ts = int(api.get_server_timestamp())
-    except Exception:
-        server_ts = int(time.time())
-    exp_blitz = server_ts + 30
 
-    registrar_ids_en_libreria()
-    ultimo_err = "Sin confirmación"
+    # Intento 1: Disparo vía Digital Spot (Ruta Nativa Blitz en IQ Option)
+    for nombre_test in [code_dig, code_otc, display_name]:
+        try:
+            api.subscribe_strike_list(nombre_test, 1)
+            time.sleep(0.2)
+            ok, id_op = api.buy_digital_spot(nombre_test, TRADE_AMOUNT, dir_str, 1)
+            if ok and id_op:
+                api.unsubscribe_strike_list(nombre_test, 1)
+                return True, f"Blitz Digital #{id_op} en `{display_name}`"
+        except Exception as e:
+            logging.warning(f"Digital spot falló en {nombre_test}: {e}")
 
-    # RUTA 1: buy_by_raw_expirations (función oficial para expiración exacta)
+    # Intento 2: Inyección directa vía WebSocket a través de api.api.buyv3
     try:
-        ok, id_op = api.buy_by_raw_expirations(TRADE_AMOUNT, par_broker, dir_str, "turbo", exp_blitz)
+        exp_time = int(api.get_server_timestamp()) + 30
+        ok, id_op = api.api.buyv3(TRADE_AMOUNT, active_id, dir_str, exp_time)
         if ok and id_op:
-            return True, f"Blitz 30s #{id_op} en `{etiqueta}`"
-        elif id_op:
-            ultimo_err = str(id_op)
+            return True, f"Blitz V3 #{id_op} en `{display_name}`"
     except Exception as e:
-        ultimo_err = str(e)
+        logging.warning(f"BuyV3 falló: {e}")
 
-    # RUTA 2: buy con expiración 1m si la opción turbo está en modo 1m
+    # Intento 3: Disparo crudo por WebSocket directo
     try:
-        ok, id_op = api.buy(TRADE_AMOUNT, par_broker, dir_str, 1)
-        if ok and (isinstance(id_op, int) or id_op):
-            return True, f"Blitz #{id_op} en `{etiqueta}`"
-        elif id_op:
-            ultimo_err = str(id_op)
+        user_balance_id = api.profile.balance_id
+        server_time = int(api.get_server_timestamp())
+        payload = {
+            "name": "sendMessage",
+            "msg": {
+                "name": "binary-options.open-option",
+                "version": "1.0",
+                "body": {
+                    "user_balance_id": user_balance_id,
+                    "active_id": active_id,
+                    "option_type_id": 3,
+                    "direction": dir_str,
+                    "expired": server_time + 30,
+                    "refund_value": 0,
+                    "price": TRADE_AMOUNT,
+                    "value": 0
+                }
+            },
+            "request_id": str(int(time.time() * 1000))
+        }
+        api.api.send_websocket(json.dumps(payload))
+        return True, f"Blitz inyectado en socket para `{display_name}` (ID: `{active_id}`)"
     except Exception as e:
-        ultimo_err = str(e)
-
-    return False, f"Rechazado ({ultimo_err})"
+        return False, f"Error final en broker: {e}"
 
 async def ejecutar_blitz_seguro(activo, direccion):
-    loop = asyncio.get_running_loop()
     try:
-        # Aislamiento en thread_pool con timeout estricto de 3.5 segundos
         return await asyncio.wait_for(
-            loop.run_in_executor(thread_pool, _disparar_blitz_worker, activo, direccion),
-            timeout=3.5
+            asyncio.to_thread(_disparar_blitz_nativo, activo, direccion),
+            timeout=3.8
         )
     except asyncio.TimeoutError:
-        return False, "Timeout: Petición enviada (esperando confirmación en broker)"
+        return False, "Timeout: Broker no devolvió respuesta en 3.8s"
     except Exception as e:
         return False, str(e)
 
