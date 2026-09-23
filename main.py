@@ -50,15 +50,14 @@ def run_web():
 # ================= 3. CONEXIÓN A IQ OPTION =================
 api = None
 
-# Mapeo oficial de activos Blitz verificados en backend
-BLITZ_MAP = {
-    "GER": {"id": 2046, "name": "GER 30 Blitz"},
-    "GER30": {"id": 2046, "name": "GER 30 Blitz"},
-    "GERMANY": {"id": 2046, "name": "GER 30 Blitz"},
-    "AU": {"id": 2048, "name": "AU 200 Blitz"},
-    "AU200": {"id": 2048, "name": "AU 200 Blitz"},
-    "AUS200": {"id": 2048, "name": "AU 200 Blitz"},
-    "TRUMP": {"id": 2265, "name": "TRUMP Coin Blitz"},
+BLITZ_REGISTRY = {
+    "GER": {"id": 2046, "name": "GER 30 Blitz", "act_name": "GER30-OTC"},
+    "GER30": {"id": 2046, "name": "GER 30 Blitz", "act_name": "GER30-OTC"},
+    "GERMANY": {"id": 2046, "name": "GER 30 Blitz", "act_name": "GER30-OTC"},
+    "AU": {"id": 2048, "name": "AU 200 Blitz", "act_name": "AUS200-OTC"},
+    "AU200": {"id": 2048, "name": "AU 200 Blitz", "act_name": "AUS200-OTC"},
+    "AUS200": {"id": 2048, "name": "AU 200 Blitz", "act_name": "AUS200-OTC"},
+    "TRUMP": {"id": 2265, "name": "TRUMP Coin Blitz", "act_name": "TRUMPUSD-OTC"},
 }
 
 def conectar_iq():
@@ -85,7 +84,7 @@ def asegurar_sesion():
         return conectar_iq()
     return True
 
-# ================= 4. MOTOR DE EJECUCIÓN BLITZ DIRECTO =================
+# ================= 4. MOTOR BLITZ DIRECTO =================
 def _disparar_blitz_nativo(activo_raw, dir_iq):
     global api
     if not asegurar_sesion():
@@ -94,35 +93,49 @@ def _disparar_blitz_nativo(activo_raw, dir_iq):
     raw = activo_raw.upper().replace("/", "").strip()
     
     target = None
-    for key, data in BLITZ_MAP.items():
+    for key, data in BLITZ_REGISTRY.items():
         if key in raw:
             target = data
             break
 
     if not target:
-        target = {"id": 2046, "name": "GER 30 Blitz"}
+        target = {"id": 2046, "name": "GER 30 Blitz", "act_name": "GER30-OTC"}
 
     active_id = target["id"]
     display_name = target["name"]
+    par_tecnico = target["act_name"]
     dir_str = "call" if "call" in dir_iq.lower() or "sube" in dir_iq.lower() else "put"
     
-    server_time = int(api.get_server_timestamp())
-    exp_blitz = server_time + 30  # 30 segundos exactos Blitz
+    # 1. Registro directo en ACTIVES_OPCODE interno para compatibilidad
+    if hasattr(api, "api") and hasattr(api.api, "ACTIVES_OPCODE"):
+        api.api.ACTIVES_OPCODE[par_tecnico] = active_id
+        api.api.ACTIVES_OPCODE[display_name] = active_id
 
-    # Intento 1: Disparo directo por buyv3 con el timestamp de 30s Blitz
+    # 2. Disparo por buy_digital_spot (30s)
     try:
-        if hasattr(api.api, "buyv3"):
-            ok, id_op = api.api.buyv3(TRADE_AMOUNT, active_id, dir_str, exp_blitz)
-            if ok and id_op:
-                return True, f"Blitz 30s #{id_op} en `{display_name}`"
+        api.subscribe_strike_list(par_tecnico, 1)
+        time.sleep(0.2)
+        ok, id_op = api.buy_digital_spot(par_tecnico, TRADE_AMOUNT, dir_str, 1)
+        if ok and id_op:
+            api.unsubscribe_strike_list(par_tecnico, 1)
+            return True, f"Blitz #{id_op} en `{display_name}`"
+    except Exception as e:
+        logging.warning(f"Fallo Digital Spot: {e}")
+
+    # 3. Disparo nativo por buyv3 con ID numérico
+    try:
+        if hasattr(api, "api") and hasattr(api.api, "buyv3"):
+            exp_time = int(api.get_server_timestamp()) + 30
+            ok, id_op = api.api.buyv3(TRADE_AMOUNT, active_id, dir_str, exp_time)
+            if ok and (isinstance(id_op, int) or id_op):
+                return True, f"Blitz #{id_op} en `{display_name}`"
     except Exception as e:
         logging.warning(f"Fallo buyv3: {e}")
 
-    # Intento 2: Inyección cruda por paquete WebSocket (protocolo blitz-options / binary-options)
+    # 4. Disparo por mensaje WebSocket directo
     try:
         user_balance_id = api.profile.balance_id
-        request_id = str(int(time.time() * 1000))
-        
+        exp_time = int(api.get_server_timestamp()) + 30
         payload = {
             "name": "sendMessage",
             "msg": {
@@ -133,17 +146,17 @@ def _disparar_blitz_nativo(activo_raw, dir_iq):
                     "active_id": active_id,
                     "option_type_id": 3,
                     "direction": dir_str,
-                    "expired": exp_blitz,
+                    "expired": exp_time,
                     "refund_value": 0,
                     "price": TRADE_AMOUNT,
                     "value": 0
                 }
             },
-            "request_id": request_id
+            "request_id": str(int(time.time() * 1000))
         }
         api.api.send_websocket(json.dumps(payload))
-        time.sleep(0.4)
-        return True, f"Blitz 30s disparado en `{display_name}` (ID: `{active_id}`)"
+        time.sleep(0.3)
+        return True, f"Blitz disparado en `{display_name}` (ID: `{active_id}`)"
     except Exception as e:
         return False, f"Rechazado en broker: {e}"
 
@@ -151,10 +164,10 @@ async def ejecutar_blitz_seguro(activo, direccion):
     try:
         return await asyncio.wait_for(
             asyncio.to_thread(_disparar_blitz_nativo, activo, direccion),
-            timeout=3.5
+            timeout=3.8
         )
     except asyncio.TimeoutError:
-        return False, "Timeout en respuesta de broker"
+        return False, "Timeout: Broker no devolvió respuesta en 3.8s"
     except Exception as e:
         return False, str(e)
 
