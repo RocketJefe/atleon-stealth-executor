@@ -1,6 +1,5 @@
 import os
 import re
-import time
 import json
 import logging
 import asyncio
@@ -30,7 +29,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-# ================= 2. SERVIDOR KEEPALIVE HTTP =================
+# ================= 2. SERVIDOR KEEPALIVE HTTP (RENDER) =================
 class KeepAliveHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -75,7 +74,7 @@ def conectar_iq():
             logging.error(f"❌ Error al conectar a IQ: {reason}")
             return False
     except Exception as e:
-        logging.error(f"❌ Excepción durante conexión: {e}")
+        logging.error(f"❌ Excepción durante la conexión: {e}")
         return False
 
 def asegurar_sesion():
@@ -84,8 +83,8 @@ def asegurar_sesion():
         return conectar_iq()
     return True
 
-# ================= 4. MOTOR BLITZ DIRECTO =================
-def _disparar_blitz_nativo(activo_raw, dir_iq):
+# ================= 4. MOTOR DE EJECUCIÓN DIRECTO BLITZ =================
+def _ejecutar_orden_sync(activo_raw, dir_iq):
     global api
     if not asegurar_sesion():
         return False, "Broker desconectado"
@@ -106,33 +105,12 @@ def _disparar_blitz_nativo(activo_raw, dir_iq):
     par_tecnico = target["act_name"]
     dir_str = "call" if "call" in dir_iq.lower() or "sube" in dir_iq.lower() else "put"
     
-    # 1. Registro directo en ACTIVES_OPCODE interno para compatibilidad
+    # Inyectar IDs en la tabla de activos si existe
     if hasattr(api, "api") and hasattr(api.api, "ACTIVES_OPCODE"):
         api.api.ACTIVES_OPCODE[par_tecnico] = active_id
         api.api.ACTIVES_OPCODE[display_name] = active_id
 
-    # 2. Disparo por buy_digital_spot (30s)
-    try:
-        api.subscribe_strike_list(par_tecnico, 1)
-        time.sleep(0.2)
-        ok, id_op = api.buy_digital_spot(par_tecnico, TRADE_AMOUNT, dir_str, 1)
-        if ok and id_op:
-            api.unsubscribe_strike_list(par_tecnico, 1)
-            return True, f"Blitz #{id_op} en `{display_name}`"
-    except Exception as e:
-        logging.warning(f"Fallo Digital Spot: {e}")
-
-    # 3. Disparo nativo por buyv3 con ID numérico
-    try:
-        if hasattr(api, "api") and hasattr(api.api, "buyv3"):
-            exp_time = int(api.get_server_timestamp()) + 30
-            ok, id_op = api.api.buyv3(TRADE_AMOUNT, active_id, dir_str, exp_time)
-            if ok and (isinstance(id_op, int) or id_op):
-                return True, f"Blitz #{id_op} en `{display_name}`"
-    except Exception as e:
-        logging.warning(f"Fallo buyv3: {e}")
-
-    # 4. Disparo por mensaje WebSocket directo
+    # 1. Disparo nativo por paquete WebSocket
     try:
         user_balance_id = api.profile.balance_id
         exp_time = int(api.get_server_timestamp()) + 30
@@ -152,22 +130,28 @@ def _disparar_blitz_nativo(activo_raw, dir_iq):
                     "value": 0
                 }
             },
-            "request_id": str(int(time.time() * 1000))
+            "request_id": str(int(asyncio.get_event_loop().time() * 1000))
         }
         api.api.send_websocket(json.dumps(payload))
-        time.sleep(0.3)
-        return True, f"Blitz disparado en `{display_name}` (ID: `{active_id}`)"
+        return True, f"Disparada en `{display_name}` (ID: `{active_id}`)"
     except Exception as e:
-        return False, f"Rechazado en broker: {e}"
+        # 2. Respaldo por buy_digital_spot
+        try:
+            ok, id_op = api.buy_digital_spot(par_tecnico, TRADE_AMOUNT, dir_str, 1)
+            if ok and id_op:
+                return True, f"Digital #{id_op} en `{display_name}`"
+        except Exception:
+            pass
+        return False, f"Rechazado ({e})"
 
-async def ejecutar_blitz_seguro(activo, direccion):
+async def disparar_blitz_seguro(activo, direccion):
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(_disparar_blitz_nativo, activo, direccion),
-            timeout=3.8
+            asyncio.to_thread(_ejecutar_orden_sync, activo, direccion),
+            timeout=3.5
         )
     except asyncio.TimeoutError:
-        return False, "Timeout: Broker no devolvió respuesta en 3.8s"
+        return False, "Timeout: Broker no devolvió respuesta en 3.5s"
     except Exception as e:
         return False, str(e)
 
@@ -212,7 +196,7 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
         activo = "TRUMP"
 
     logging.info(f"⚡ [DISPARO BLITZ]: {activo} {direccion}")
-    exito, info = await ejecutar_blitz_seguro(activo, direccion)
+    exito, info = await disparar_blitz_seguro(activo, direccion)
 
     estado = "✅" if exito else "⚠️"
     await update.message.reply_text(
