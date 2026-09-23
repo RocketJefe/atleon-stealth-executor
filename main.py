@@ -1,8 +1,9 @@
 import os
 import re
-import json
+import time
 import logging
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
@@ -29,7 +30,10 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-# ================= 2. SERVIDOR KEEPALIVE HTTP (RENDER) =================
+# Pool dedicado para llamadas bloqueantes al broker
+thread_pool = ThreadPoolExecutor(max_workers=4)
+
+# ================= 2. SERVIDOR KEEPALIVE HTTP =================
 class KeepAliveHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -46,18 +50,30 @@ def run_web():
     server = HTTPServer(("0.0.0.0", port), KeepAliveHandler)
     server.serve_forever()
 
-# ================= 3. CONEXIÓN A IQ OPTION =================
+# ================= 3. CONEXIÓN PERSISTENTE A IQ OPTION =================
 api = None
 
-BLITZ_REGISTRY = {
-    "GER": {"id": 2046, "name": "GER 30 Blitz", "act_name": "GER30-OTC"},
-    "GER30": {"id": 2046, "name": "GER 30 Blitz", "act_name": "GER30-OTC"},
-    "GERMANY": {"id": 2046, "name": "GER 30 Blitz", "act_name": "GER30-OTC"},
-    "AU": {"id": 2048, "name": "AU 200 Blitz", "act_name": "AUS200-OTC"},
-    "AU200": {"id": 2048, "name": "AU 200 Blitz", "act_name": "AUS200-OTC"},
-    "AUS200": {"id": 2048, "name": "AU 200 Blitz", "act_name": "AUS200-OTC"},
-    "TRUMP": {"id": 2265, "name": "TRUMP Coin Blitz", "act_name": "TRUMPUSD-OTC"},
+# Mapeo exacto comprobado en el backend de IQ Option
+BLITZ_MAP = {
+    "GER": {"name": "GER30-OTC", "id": 2046, "label": "GER 30 Blitz"},
+    "GER30": {"name": "GER30-OTC", "id": 2046, "label": "GER 30 Blitz"},
+    "GERMANY": {"name": "GER30-OTC", "id": 2046, "label": "GER 30 Blitz"},
+    "AU": {"name": "AUS200-OTC", "id": 2048, "label": "AU 200 Blitz"},
+    "AU200": {"name": "AUS200-OTC", "id": 2048, "label": "AU 200 Blitz"},
+    "AUS200": {"name": "AUS200-OTC", "id": 2048, "label": "AU 200 Blitz"},
+    "TRUMP": {"name": "TRUMPUSD-OTC", "id": 2265, "label": "TRUMP Coin Blitz"},
 }
+
+def registrar_ids_en_libreria():
+    """Inyecta los nombres e IDs en el diccionario interno para que las funciones nativas los reconozcan"""
+    global api
+    if api and hasattr(api, "api") and hasattr(api.api, "ACTIVES_OPCODE"):
+        try:
+            for _, data in BLITZ_MAP.items():
+                api.api.ACTIVES_OPCODE[data["name"]] = data["id"]
+                api.api.ACTIVES_OPCODE[data["label"]] = data["id"]
+        except Exception as e:
+            logging.warning(f"Aviso registrando activos: {e}")
 
 def conectar_iq():
     global api
@@ -68,13 +84,14 @@ def conectar_iq():
         if ok:
             cliente.change_balance(IQ_ACCOUNT_TYPE)
             api = cliente
+            registrar_ids_en_libreria()
             logging.info(f"⚡ [BLITZ ENGINE LISTO] Cuenta: {IQ_ACCOUNT_TYPE} | Saldo: ${api.get_balance():.2f}")
             return True
         else:
             logging.error(f"❌ Error al conectar a IQ: {reason}")
             return False
     except Exception as e:
-        logging.error(f"❌ Excepción durante la conexión: {e}")
+        logging.error(f"❌ Excepción durante conexión: {e}")
         return False
 
 def asegurar_sesion():
@@ -83,75 +100,68 @@ def asegurar_sesion():
         return conectar_iq()
     return True
 
-# ================= 4. MOTOR DE EJECUCIÓN DIRECTO BLITZ =================
-def _ejecutar_orden_sync(activo_raw, dir_iq):
+# ================= 4. MOTOR DE EJECUCIÓN BLITZ CON buy_by_raw_expirations =================
+def _disparar_blitz_worker(activo_raw, dir_iq):
     global api
     if not asegurar_sesion():
         return False, "Broker desconectado"
 
     raw = activo_raw.upper().replace("/", "").strip()
-    
     target = None
-    for key, data in BLITZ_REGISTRY.items():
+    for key, data in BLITZ_MAP.items():
         if key in raw:
             target = data
             break
 
     if not target:
-        target = {"id": 2046, "name": "GER 30 Blitz", "act_name": "GER30-OTC"}
+        target = BLITZ_MAP["GER"]
 
-    active_id = target["id"]
-    display_name = target["name"]
-    par_tecnico = target["act_name"]
+    par_broker = target["name"]
+    etiqueta = target["label"]
     dir_str = "call" if "call" in dir_iq.lower() or "sube" in dir_iq.lower() else "put"
     
-    # Inyectar IDs en la tabla de activos si existe
-    if hasattr(api, "api") and hasattr(api.api, "ACTIVES_OPCODE"):
-        api.api.ACTIVES_OPCODE[par_tecnico] = active_id
-        api.api.ACTIVES_OPCODE[display_name] = active_id
-
-    # 1. Disparo nativo por paquete WebSocket
+    # Calcular expiración: tiempo actual del broker + 30 segundos
     try:
-        user_balance_id = api.profile.balance_id
-        exp_time = int(api.get_server_timestamp()) + 30
-        payload = {
-            "name": "sendMessage",
-            "msg": {
-                "name": "binary-options.open-option",
-                "version": "1.0",
-                "body": {
-                    "user_balance_id": user_balance_id,
-                    "active_id": active_id,
-                    "option_type_id": 3,
-                    "direction": dir_str,
-                    "expired": exp_time,
-                    "refund_value": 0,
-                    "price": TRADE_AMOUNT,
-                    "value": 0
-                }
-            },
-            "request_id": str(int(asyncio.get_event_loop().time() * 1000))
-        }
-        api.api.send_websocket(json.dumps(payload))
-        return True, f"Disparada en `{display_name}` (ID: `{active_id}`)"
+        server_ts = int(api.get_server_timestamp())
+    except Exception:
+        server_ts = int(time.time())
+    exp_blitz = server_ts + 30
+
+    registrar_ids_en_libreria()
+    ultimo_err = "Sin confirmación"
+
+    # RUTA 1: buy_by_raw_expirations (función oficial para expiración exacta)
+    try:
+        ok, id_op = api.buy_by_raw_expirations(TRADE_AMOUNT, par_broker, dir_str, "turbo", exp_blitz)
+        if ok and id_op:
+            return True, f"Blitz 30s #{id_op} en `{etiqueta}`"
+        elif id_op:
+            ultimo_err = str(id_op)
     except Exception as e:
-        # 2. Respaldo por buy_digital_spot
-        try:
-            ok, id_op = api.buy_digital_spot(par_tecnico, TRADE_AMOUNT, dir_str, 1)
-            if ok and id_op:
-                return True, f"Digital #{id_op} en `{display_name}`"
-        except Exception:
-            pass
-        return False, f"Rechazado ({e})"
+        ultimo_err = str(e)
 
-async def disparar_blitz_seguro(activo, direccion):
+    # RUTA 2: buy con expiración 1m si la opción turbo está en modo 1m
     try:
+        ok, id_op = api.buy(TRADE_AMOUNT, par_broker, dir_str, 1)
+        if ok and (isinstance(id_op, int) or id_op):
+            return True, f"Blitz #{id_op} en `{etiqueta}`"
+        elif id_op:
+            ultimo_err = str(id_op)
+    except Exception as e:
+        ultimo_err = str(e)
+
+    return False, f"Rechazado ({ultimo_err})"
+
+async def ejecutar_blitz_seguro(activo, direccion):
+    loop = asyncio.get_running_loop()
+    try:
+        # Aislamiento en thread_pool con timeout estricto de 3.5 segundos
         return await asyncio.wait_for(
-            asyncio.to_thread(_ejecutar_orden_sync, activo, direccion),
+            loop.run_in_executor(thread_pool, _disparar_blitz_worker, activo, direccion),
             timeout=3.5
         )
     except asyncio.TimeoutError:
-        return False, "Timeout: Broker no devolvió respuesta en 3.5s"
+        return False, "Timeout: Petición enviada (esperando confirmación en broker)"
     except Exception as e:
         return False, str(e)
 
@@ -196,7 +206,7 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
         activo = "TRUMP"
 
     logging.info(f"⚡ [DISPARO BLITZ]: {activo} {direccion}")
-    exito, info = await disparar_blitz_seguro(activo, direccion)
+    exito, info = await ejecutar_blitz_seguro(activo, direccion)
 
     estado = "✅" if exito else "⚠️"
     await update.message.reply_text(
