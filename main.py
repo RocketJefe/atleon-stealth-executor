@@ -73,42 +73,31 @@ def asegurar_sesion():
         return conectar_iq()
     return True
 
-# ================= 4. MOTOR DE EJECUCIÓN A 60 SEGUNDOS =================
+# ================= 4. MOTOR DE EJECUCIÓN DIRECTO A 60S =================
 def _ejecutar_en_broker(par_solicitado, dir_iq):
     global api
     if not asegurar_sesion():
         return False, "Broker desconectado"
 
-    par = par_solicitado.upper().replace("/", "").replace(" ", "").strip()
-    candidatos = [par]
+    par_limpio = par_solicitado.upper().replace("/", "").replace(" ", "").strip()
     
-    if "-OTC" in par:
-        candidatos.append(par.replace("-OTC", ""))
+    # En días de semana operan los pares reales; los fines de semana o fuera de sesión operan OTC
+    candidatos = [par_limpio]
+    if "-OTC" in par_limpio:
+        candidatos.append(par_limpio.replace("-OTC", ""))
     else:
-        candidatos.append(f"{par}-OTC")
+        candidatos.append(f"{par_limpio}-OTC")
 
-    ultimo_error = "No disponible"
+    ultimo_error = "Par no disponible"
 
-    # Ruta 1: Binaria Turbo (Expiración exacta de 1 minuto / 60s)
     for p in candidatos:
         try:
+            # Disparo Turbo directo a 1 minuto (60s) sin esperas de strikes
             ok, id_op = api.buy(TRADE_AMOUNT, p, dir_iq, 1)
             if ok and (isinstance(id_op, int) or id_op):
                 return True, f"Binaria 60s #{id_op} en {p}"
             elif id_op:
                 ultimo_error = str(id_op)
-        except Exception as e:
-            ultimo_error = str(e)
-
-    # Ruta 2: Fallback a Digital Spot (1 minuto) si Binarias está temporalmente pausado
-    for p in candidatos:
-        try:
-            api.subscribe_strike_list(p, 1)
-            time.sleep(0.3)
-            ok, id_op = api.buy_digital_spot(p, TRADE_AMOUNT, dir_iq, 1)
-            if ok and id_op:
-                api.unsubscribe_strike_list(p, 1)
-                return True, f"Digital 60s #{id_op} en {p}"
         except Exception as e:
             ultimo_error = str(e)
 
@@ -119,10 +108,10 @@ async def disparar_orden_segura(par, direccion):
     try:
         return await asyncio.wait_for(
             asyncio.to_thread(_ejecutar_en_broker, par, dir_iq),
-            timeout=4.5
+            timeout=5.0
         )
     except asyncio.TimeoutError:
-        return False, "Timeout: Broker tardó más de 4.5s"
+        return False, "Timeout en conexión con broker (5s)"
     except Exception as e:
         return False, str(e)
 
@@ -140,6 +129,31 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Sin conexión con IQ Option.")
 
+async def abiertos_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not asegurar_sesion():
+        await update.message.reply_text("❌ Broker desconectado.")
+        return
+
+    msg = await update.message.reply_text("🔍 Consultando pares de 60s abiertos en este momento...")
+    try:
+        all_actives = api.get_all_init()
+        turbo_actives = all_actives.get("result", {}).get("turbo", {}).get("actives", {})
+        
+        abiertos = []
+        for aid, data in turbo_actives.items():
+            if data.get("enabled", False) and not data.get("is_suspended", True):
+                name = data.get("name", "")
+                if "/" in name or "USD" in name or "EUR" in name:
+                    abiertos.append(name.replace("/", ""))
+
+        if abiertos:
+            resumen = ", ".join(abiertos[:10])
+            await msg.edit_text(f"⚡ Pares Turbo 60s Abiertos:\n\n{resumen}")
+        else:
+            await msg.edit_text("⚠️ No se detectaron pares de 60s abiertos en este segundo.")
+    except Exception as e:
+        await msg.edit_text(f"❌ Error al consultar: {e}")
+
 async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -156,7 +170,7 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not direccion:
         return
 
-    # 2. Identificar el Par solicitado
+    # 2. Identificar Activo
     par = None
     if "EURUSD" in texto:
         par = "EURUSD-OTC" if "OTC" in texto else "EURUSD"
@@ -190,6 +204,7 @@ if __name__ == "__main__":
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("abiertos", abiertos_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_mensaje))
 
     app.run_polling(drop_pending_updates=True)
